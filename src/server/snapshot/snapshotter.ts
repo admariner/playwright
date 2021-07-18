@@ -17,7 +17,7 @@
 import { BrowserContext } from '../browserContext';
 import { Page } from '../page';
 import * as network from '../network';
-import { helper, RegisteredListener } from '../helper';
+import { eventsHelper, RegisteredListener } from '../../utils/eventsHelper';
 import { debugLogger } from '../../utils/debugLogger';
 import { Frame } from '../frames';
 import { frameSnapshotStreamer, SnapshotData } from './snapshotterInjected';
@@ -67,7 +67,7 @@ export class Snapshotter {
     // Replay resources loaded in all pages.
     for (const page of this._context.pages()) {
       for (const response of page._frameManager._responses)
-        this._saveResource(page, response).catch(e => debugLogger.log('error', e));
+        this._saveResource(response).catch(e => debugLogger.log('error', e));
     }
   }
 
@@ -79,7 +79,10 @@ export class Snapshotter {
     for (const page of this._context.pages())
       this._onPage(page);
     this._eventListeners = [
-      helper.addEventListener(this._context, BrowserContext.Events.Page, this._onPage.bind(this)),
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.Page, this._onPage.bind(this)),
+      eventsHelper.addEventListener(this._context, BrowserContext.Events.Response, (response: network.Response) => {
+        this._saveResource(response).catch(e => debugLogger.log('error', e));
+      }),
     ];
 
     const initScript = `(${frameSnapshotStreamer})("${this._snapshotStreamer}")`;
@@ -92,12 +95,12 @@ export class Snapshotter {
     for (const page of this._context.pages())
       frames.push(...page.frames());
     await Promise.all(frames.map(frame => {
-      return frame.nonStallingRawEvaluateInExistingMainContext(expression).catch(debugExceptionHandler);
+      return frame.nonStallingRawEvaluateInExistingMainContext(expression).catch(e => debugLogger.log('error', e));
     }));
   }
 
   dispose() {
-    helper.removeEventListeners(this._eventListeners);
+    eventsHelper.removeEventListeners(this._eventListeners);
   }
 
   async captureSnapshot(page: Page, snapshotName: string, element?: ElementHandle): Promise<void> {
@@ -111,9 +114,9 @@ export class Snapshotter {
 
     // In each frame, in a non-stalling manner, capture the snapshots.
     const snapshots = page.frames().map(async frame => {
-      const data = await frame.nonStallingRawEvaluateInExistingMainContext(expression).catch(debugExceptionHandler) as SnapshotData;
+      const data = await frame.nonStallingRawEvaluateInExistingMainContext(expression).catch(e => debugLogger.log('error', e)) as SnapshotData;
       // Something went wrong -> bail out, our snapshots are best-efforty.
-      if (!data)
+      if (!data || !this._started)
         return;
 
       const snapshot: FrameSnapshot = {
@@ -125,7 +128,6 @@ export class Snapshotter {
         html: data.html,
         viewport: data.viewport,
         timestamp: monotonicTime(),
-        pageTimestamp: data.timestamp,
         collectionTime: data.collectionTime,
         resourceOverrides: [],
         isMainFrame: page.mainFrame() === frame
@@ -149,14 +151,10 @@ export class Snapshotter {
     // Annotate frame hierarchy so that snapshots could include frame ids.
     for (const frame of page.frames())
       this._annotateFrameHierarchy(frame);
-    this._eventListeners.push(helper.addEventListener(page, Page.Events.FrameAttached, frame => this._annotateFrameHierarchy(frame)));
-
-    this._eventListeners.push(helper.addEventListener(page, Page.Events.Response, (response: network.Response) => {
-      this._saveResource(page, response).catch(e => debugLogger.log('error', e));
-    }));
+    this._eventListeners.push(eventsHelper.addEventListener(page, Page.Events.FrameAttached, frame => this._annotateFrameHierarchy(frame)));
   }
 
-  private async _saveResource(page: Page, response: network.Response) {
+  private async _saveResource(response: network.Response) {
     if (!this._started)
       return;
     const isRedirect = response.status() >= 300 && response.status() <= 399;
@@ -199,10 +197,11 @@ export class Snapshotter {
     }
 
     const resource: ResourceSnapshot = {
-      pageId: page.guid,
+      pageId: response.frame()._page.guid,
       frameId: response.frame().guid,
-      resourceId: 'resource@' + createGuid(),
+      resourceId: response.guid,
       url,
+      type: response.request().resourceType(),
       contentType,
       responseHeaders: response.headers(),
       requestHeaders,
@@ -229,8 +228,4 @@ export class Snapshotter {
     } catch (e) {
     }
   }
-}
-
-function debugExceptionHandler(e: Error) {
-  // console.error(e);
 }

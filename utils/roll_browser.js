@@ -30,7 +30,7 @@ function usage() {
 usage: ${SCRIPT_NAME} <browser> <revision>
 
 Roll the <browser> to a specific <revision> and generate new protocol.
-Supported browsers: chromium, firefox, webkit, ffmpeg, firefox-stable, webkit-technology-preview.
+Supported browsers: chromium, firefox, webkit, ffmpeg, firefox-beta.
 
 Example:
   ${SCRIPT_NAME} chromium 123456
@@ -66,17 +66,19 @@ Example:
   // 2. Update browsers.json.
   console.log('\nUpdating browsers.json...');
   descriptor.revision = String(revision);
+  if (browserName === 'chromium')
+    browsersJSON.browsers.find(b => b.name === 'chromium-with-symbols').revision = String(revision);
   fs.writeFileSync(path.join(ROOT_PATH, 'browsers.json'), JSON.stringify(browsersJSON, null, 2) + '\n');
 
   if (descriptor.installByDefault) {
     // 3. Download new browser.
     console.log('\nDownloading new browser...');
-    const { installBrowsersWithProgressBar } = require('../lib/install/installer');
-    await installBrowsersWithProgressBar();
+    const registry = new Registry(ROOT_PATH);
+    await registry.install();
 
     // 4. Generate types.
     console.log('\nGenerating protocol types...');
-    const executablePath = new Registry(ROOT_PATH).executablePath(browserName);
+    const executablePath = registry.findExecutable(browserName).executablePathOrDie();
     await protocolGenerator.generateProtocol(browserName, executablePath).catch(console.warn);
 
     // 5. Update docs.

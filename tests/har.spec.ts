@@ -16,8 +16,11 @@
  */
 
 import { browserTest as it, expect } from './config/browserTest';
+import * as path from 'path';
 import fs from 'fs';
+import http2 from 'http2';
 import type { BrowserContext, BrowserContextOptions } from '../index';
+import type { AddressInfo } from 'net';
 
 async function pageWithHar(contextFactory: (options?: BrowserContextOptions) => Promise<BrowserContext>, testInfo: any) {
   const harPath = testInfo.outputPath('test.har');
@@ -25,6 +28,7 @@ async function pageWithHar(contextFactory: (options?: BrowserContextOptions) => 
   const page = await context.newPage();
   return {
     page,
+    context,
     getLog: async () => {
       await context.close();
       return JSON.parse(fs.readFileSync(harPath).toString())['log'];
@@ -95,6 +99,7 @@ it('should include request', async ({ contextFactory, server }, testInfo) => {
   expect(entry.request.httpVersion).toBe('HTTP/1.1');
   expect(entry.request.headers.length).toBeGreaterThan(1);
   expect(entry.request.headers.find(h => h.name.toLowerCase() === 'user-agent')).toBeTruthy();
+  expect(entry.request.bodySize).toBe(0);
 });
 
 it('should include response', async ({ contextFactory, server }, testInfo) => {
@@ -241,13 +246,233 @@ it('should include content', async ({ contextFactory, server }, testInfo) => {
   await page.goto(server.PREFIX + '/har.html');
   const log = await getLog();
 
-  const content1 = log.entries[0].response.content;
-  expect(content1.encoding).toBe('base64');
-  expect(content1.mimeType).toBe('text/html; charset=utf-8');
-  expect(Buffer.from(content1.text, 'base64').toString()).toContain('HAR Page');
+  expect(log.entries[0].response.httpVersion).toBe('HTTP/1.1');
+  expect(log.entries[0].response.content.encoding).toBe('base64');
+  expect(log.entries[0].response.content.mimeType).toBe('text/html; charset=utf-8');
+  expect(Buffer.from(log.entries[0].response.content.text, 'base64').toString()).toContain('HAR Page');
+  expect(log.entries[0].response.content.size).toBeGreaterThanOrEqual(96);
+  expect(log.entries[0].response.content.compression).toBe(0);
 
-  const content2 = log.entries[1].response.content;
-  expect(content2.encoding).toBe('base64');
-  expect(content2.mimeType).toBe('text/css; charset=utf-8');
-  expect(Buffer.from(content2.text, 'base64').toString()).toContain('pink');
+  expect(log.entries[1].response.httpVersion).toBe('HTTP/1.1');
+  expect(log.entries[1].response.content.encoding).toBe('base64');
+  expect(log.entries[1].response.content.mimeType).toBe('text/css; charset=utf-8');
+  expect(Buffer.from(log.entries[1].response.content.text, 'base64').toString()).toContain('pink');
+  expect(log.entries[1].response.content.size).toBeGreaterThanOrEqual(37);
+  expect(log.entries[1].response.content.compression).toBe(0);
+});
+
+it('should include sizes', async ({ contextFactory, server, browserName, platform }, testInfo) => {
+  it.fixme(browserName === 'webkit' && platform === 'linux', 'blocked by libsoup3');
+
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.PREFIX + '/har.html');
+  const log = await getLog();
+
+  expect(log.entries[0].request.headersSize).toBeGreaterThanOrEqual(280);
+  expect(log.entries[0].response.bodySize).toBeGreaterThanOrEqual(96);
+  expect(log.entries[0].response.headersSize).toBe(198);
+  expect(log.entries[0].response._transferSize).toBeGreaterThanOrEqual(294);
+
+  expect(log.entries[1].response.bodySize).toBeGreaterThanOrEqual(37);
+  expect(log.entries[1].response.headersSize).toBe(197);
+  expect(log.entries[1].response._transferSize).toBeGreaterThanOrEqual(234);
+});
+
+it('should calculate time', async ({ contextFactory, server }, testInfo) => {
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.PREFIX + '/har.html');
+  const log = await getLog();
+  expect(log.entries[0].time).toBeGreaterThan(0);
+});
+
+it('should report the correct _transferSize with PNG files', async ({ contextFactory, server, browserName, platform }, testInfo) => {
+  it.fixme(browserName === 'webkit' && platform === 'linux', 'blocked by libsoup3');
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.EMPTY_PAGE);
+  await page.setContent(`
+    <img src="${server.PREFIX}/pptr.png" />
+  `);
+  const log = await getLog();
+  expect(log.entries[1].response._transferSize).toBe(6323);
+});
+
+it('should have -1 _transferSize when its a failed request', async ({ contextFactory, server }, testInfo) => {
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  server.setRoute('/one-style.css', (req, res) => {
+    res.setHeader('Content-Type', 'text/css');
+    res.connection.destroy();
+  });
+  const failedRequests = [];
+  page.on('requestfailed', request => failedRequests.push(request));
+  await page.goto(server.PREFIX + '/har.html');
+  const log = await getLog();
+  expect(log.entries[1].request.url.endsWith('/one-style.css')).toBe(true);
+  expect(log.entries[1].response._transferSize).toBe(-1);
+});
+
+it('should report the correct body size', async ({ contextFactory, server }, testInfo) => {
+  server.setRoute('/api', (req, res) => res.end());
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.EMPTY_PAGE);
+  await Promise.all([
+    page.waitForResponse(server.PREFIX + '/api'),
+    page.evaluate(() => {
+      fetch('/api', {
+        method: 'POST',
+        body: 'abc123'
+      });
+    })
+  ]);
+  const log = await getLog();
+  expect(log.entries[1].request.bodySize).toBe(6);
+});
+
+it('should have popup requests', async ({ contextFactory, server }, testInfo) => {
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.EMPTY_PAGE);
+  await page.setContent('<a target=_blank rel=noopener href="/one-style.html">yo</a>');
+  const [popup] = await Promise.all([
+    page.waitForEvent('popup'),
+    page.click('a'),
+  ]);
+  await popup.waitForLoadState();
+  const log = await getLog();
+
+  expect(log.pages.length).toBe(2);
+  expect(log.pages[0].id).toBe('page_0');
+  expect(log.pages[1].id).toBe('page_1');
+
+  const entries = log.entries.filter(entry => entry.pageref === 'page_1');
+  expect(entries.length).toBe(2);
+  expect(entries[0].request.url).toBe(server.PREFIX + '/one-style.html');
+  expect(entries[0].response.status).toBe(200);
+  expect(entries[1].request.url).toBe(server.PREFIX + '/one-style.css');
+  expect(entries[1].response.status).toBe(200);
+});
+
+it('should not contain internal pages', async ({ browserName, contextFactory, server }, testInfo) => {
+  it.fixme(true, 'https://github.com/microsoft/playwright/issues/6743');
+  server.setRoute('/empty.html', (req, res) => {
+    res.setHeader('Set-Cookie', 'name=value');
+    res.end();
+  });
+
+  const { page, context, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.EMPTY_PAGE);
+
+  const cookies = await context.cookies();
+  expect(cookies.length).toBe(1);
+  // Get storage state, this create internal page.
+  await context.storageState();
+
+  const log = await getLog();
+  expect(log.pages.length).toBe(1);
+});
+
+it('should have connection details', async ({ contextFactory, server, browserName, platform }, testInfo) => {
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.EMPTY_PAGE);
+  const log = await getLog();
+  const { serverIPAddress, _serverPort: port, _securityDetails: securityDetails } = log.entries[0];
+  expect(serverIPAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+  expect(port).toBe(server.PORT);
+  expect(securityDetails).toEqual({});
+});
+
+it('should have security details', async ({ contextFactory, httpsServer, browserName, platform }, testInfo) => {
+  it.fail(browserName === 'webkit' && platform === 'linux', 'https://github.com/microsoft/playwright/issues/6759');
+
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(httpsServer.EMPTY_PAGE);
+  const log = await getLog();
+  const { serverIPAddress, _serverPort: port, _securityDetails: securityDetails } = log.entries[0];
+  expect(serverIPAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+  expect(port).toBe(httpsServer.PORT);
+  if (browserName === 'webkit' && platform === 'win32')
+    expect(securityDetails).toEqual({subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: -1});
+  else if (browserName === 'webkit')
+    expect(securityDetails).toEqual({protocol: 'TLS 1.3', subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: 33086084863});
+  else
+    expect(securityDetails).toEqual({issuer: 'puppeteer-tests', protocol: 'TLS 1.3', subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: 33086084863});
+});
+
+it('should have connection details for redirects', async ({ contextFactory, server, browserName }, testInfo) => {
+  server.setRedirect('/foo.html', '/empty.html');
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.PREFIX + '/foo.html');
+  const log = await getLog();
+  expect(log.entries.length).toBe(2);
+
+  const detailsFoo = log.entries[0];
+
+  if (browserName === 'webkit') {
+    expect(detailsFoo.serverIPAddress).toBeUndefined();
+    expect(detailsFoo._serverPort).toBeUndefined();
+  } else {
+    expect(detailsFoo.serverIPAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+    expect(detailsFoo._serverPort).toBe(server.PORT);
+  }
+
+  const detailsEmpty = log.entries[1];
+  expect(detailsEmpty.serverIPAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+  expect(detailsEmpty._serverPort).toBe(server.PORT);
+});
+
+it('should have connection details for failed requests', async ({ contextFactory, server, browserName, platform }, testInfo) => {
+  server.setRoute('/one-style.css', (_, res) => {
+    res.setHeader('Content-Type', 'text/css');
+    res.connection.destroy();
+  });
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(server.PREFIX + '/one-style.html');
+  const log = await getLog();
+  const { serverIPAddress, _serverPort: port } = log.entries[0];
+  expect(serverIPAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+  expect(port).toBe(server.PORT);
+});
+
+it('should return server address directly from response', async ({ page, server }) => {
+  const response = await page.goto(server.EMPTY_PAGE);
+  const { ipAddress, port } = await response.serverAddr();
+  expect(ipAddress).toMatch(/^127\.0\.0\.1|\[::1\]/);
+  expect(port).toBe(server.PORT);
+});
+
+it('should return security details directly from response', async ({ contextFactory, httpsServer, browserName, platform }) => {
+  it.fail(browserName === 'webkit' && platform === 'linux', 'https://github.com/microsoft/playwright/issues/6759');
+
+  const context = await contextFactory({ ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+  const response = await page.goto(httpsServer.EMPTY_PAGE);
+  const securityDetails = await response.securityDetails();
+  if (browserName === 'webkit' && platform === 'win32')
+    expect(securityDetails).toEqual({subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: -1});
+  else if (browserName === 'webkit')
+    expect(securityDetails).toEqual({protocol: 'TLS 1.3', subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: 33086084863});
+  else
+    expect(securityDetails).toEqual({issuer: 'puppeteer-tests', protocol: 'TLS 1.3', subjectName: 'puppeteer-tests', validFrom: 1550084863, validTo: 33086084863});
+});
+
+it('should contain http2 for http2 requests', async ({ contextFactory, browserName }, testInfo) => {
+  it.fixme(browserName === 'firefox' || browserName === 'webkit');
+
+  const server = http2.createSecureServer({
+    key: await fs.promises.readFile(path.join(__dirname, '..', 'utils', 'testserver', 'key.pem')),
+    cert: await fs.promises.readFile(path.join(__dirname, '..', 'utils', 'testserver', 'cert.pem')),
+  });
+  server.on('stream', stream => {
+    stream.respond({
+      'content-type': 'text/html; charset=utf-8',
+      ':status': 200
+    });
+    stream.end('<h1>Hello World</h1>');
+  });
+  server.listen(0);
+
+  const { page, getLog } = await pageWithHar(contextFactory, testInfo);
+  await page.goto(`https://localhost:${(server.address() as AddressInfo).port}`);
+  const log = await getLog();
+  expect(log.entries[0].request.httpVersion).toBe('h2');
+  expect(log.entries[0].response.httpVersion).toBe('h2');
+  server.close();
 });

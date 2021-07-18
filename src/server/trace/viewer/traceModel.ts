@@ -18,84 +18,79 @@ import fs from 'fs';
 import path from 'path';
 import * as trace from '../common/traceEvents';
 import { ContextResources, ResourceSnapshot } from '../../snapshot/snapshotTypes';
-import { BaseSnapshotStorage, SnapshotStorage } from '../../snapshot/snapshotStorage';
+import { BaseSnapshotStorage } from '../../snapshot/snapshotStorage';
+import { BrowserContextOptions } from '../../types';
+import { shouldCaptureSnapshot, VERSION } from '../recorder/tracing';
 export * as trace from '../common/traceEvents';
 
 export class TraceModel {
-  contextEntry: ContextEntry | undefined;
+  contextEntry: ContextEntry;
   pageEntries = new Map<string, PageEntry>();
   contextResources = new Map<string, ContextResources>();
   private _snapshotStorage: PersistentSnapshotStorage;
+  private _version: number | undefined;
 
   constructor(snapshotStorage: PersistentSnapshotStorage) {
     this._snapshotStorage = snapshotStorage;
+    this.contextEntry = {
+      startTime: Number.MAX_VALUE,
+      endTime: Number.MIN_VALUE,
+      browserName: '',
+      options: { sdkLanguage: '' },
+      pages: [],
+      resources: []
+    };
   }
 
-  appendEvents(events: trace.TraceEvent[], snapshotStorage: SnapshotStorage) {
-    for (const event of events)
-      this.appendEvent(event);
-    const actions: ActionEntry[] = [];
+  build() {
     for (const page of this.contextEntry!.pages)
-      actions.push(...page.actions);
-
-    const resources = snapshotStorage.resources().reverse();
-    actions.reverse();
-
-    for (const action of actions) {
-      while (resources.length && resources[0].timestamp > action.timestamp)
-        action.resources.push(resources.shift()!);
-      action.resources.reverse();
-    }
+      page.actions.sort((a1, a2) => a1.metadata.startTime - a2.metadata.startTime);
+    this.contextEntry!.resources = this._snapshotStorage.resources();
   }
 
-  appendEvent(event: trace.TraceEvent) {
+  private _pageEntry(pageId: string): PageEntry {
+    let pageEntry = this.pageEntries.get(pageId);
+    if (!pageEntry) {
+      pageEntry = {
+        actions: [],
+        events: [],
+        objects: {},
+        screencastFrames: [],
+      };
+      this.pageEntries.set(pageId, pageEntry);
+      this.contextEntry.pages.push(pageEntry);
+    }
+    return pageEntry;
+  }
+
+  appendEvent(line: string) {
+    const event = this._modernize(JSON.parse(line));
     switch (event.type) {
-      case 'context-metadata': {
-        this.contextEntry = {
-          startTime: Number.MAX_VALUE,
-          endTime: Number.MIN_VALUE,
-          created: event,
-          pages: [],
-        };
-        break;
-      }
-      case 'page-created': {
-        const pageEntry: PageEntry = {
-          created: event,
-          destroyed: undefined as any,
-          actions: [],
-          interestingEvents: [],
-          screencastFrames: [],
-        };
-        this.pageEntries.set(event.pageId, pageEntry);
-        this.contextEntry!.pages.push(pageEntry);
-        break;
-      }
-      case 'page-destroyed': {
-        this.pageEntries.get(event.pageId)!.destroyed = event;
+      case 'context-options': {
+        this._version = event.version || 0;
+        this.contextEntry.browserName = event.browserName;
+        this.contextEntry.options = event.options;
         break;
       }
       case 'screencast-frame': {
-        this.pageEntries.get(event.pageId)!.screencastFrames.push(event);
+        this._pageEntry(event.pageId).screencastFrames.push(event);
         break;
       }
       case 'action': {
         const metadata = event.metadata;
-        const pageEntry = this.pageEntries.get(metadata.pageId!)!;
-        const action: ActionEntry = {
-          actionId: metadata.id,
-          resources: [],
-          ...event,
-        };
-        pageEntry.actions.push(action);
+        const include = event.hasSnapshot;
+        if (include && metadata.pageId)
+          this._pageEntry(metadata.pageId).actions.push(event);
         break;
       }
-      case 'dialog-opened':
-      case 'dialog-closed':
-      case 'navigation':
-      case 'load': {
-        const pageEntry = this.pageEntries.get(event.pageId)!;
-        pageEntry.interestingEvents.push(event);
+      case 'event': {
+        const metadata = event.metadata;
+        if (metadata.pageId) {
+          if (metadata.method === '__create__')
+            this._pageEntry(metadata.pageId).objects[metadata.params.guid] = metadata.params.initializer;
+          else
+            this._pageEntry(metadata.pageId).events.push(event);
+        }
         break;
       }
       case 'resource-snapshot':
@@ -105,36 +100,50 @@ export class TraceModel {
         this._snapshotStorage.addFrameSnapshot(event.snapshot);
         break;
     }
-    this.contextEntry!.startTime = Math.min(this.contextEntry!.startTime, event.timestamp);
-    this.contextEntry!.endTime = Math.max(this.contextEntry!.endTime, event.timestamp);
+    if (event.type === 'action' || event.type === 'event') {
+      this.contextEntry!.startTime = Math.min(this.contextEntry!.startTime, event.metadata.startTime);
+      this.contextEntry!.endTime = Math.max(this.contextEntry!.endTime, event.metadata.endTime);
+    }
+  }
+
+  private _modernize(event: any): trace.TraceEvent {
+    if (this._version === undefined)
+      return event;
+    for (let version = this._version; version < VERSION; ++version)
+      event = (this as any)[`_modernize_${version}_to_${version + 1}`].call(this, event);
+    return event;
+  }
+
+  _modernize_0_to_1(event: any): any {
+    if (event.type === 'action') {
+      if (typeof event.metadata.error === 'string')
+        event.metadata.error = { error: { name: 'Error', message: event.metadata.error } };
+      if (event.metadata && typeof event.hasSnapshot !== 'boolean')
+        event.hasSnapshot = shouldCaptureSnapshot(event.metadata);
+    }
+    return event;
   }
 }
 
 export type ContextEntry = {
   startTime: number;
   endTime: number;
-  created: trace.ContextCreatedTraceEvent;
+  browserName: string;
+  options: BrowserContextOptions;
   pages: PageEntry[];
-}
-
-export type InterestingPageEvent = trace.DialogOpenedEvent | trace.DialogClosedEvent | trace.NavigationEvent | trace.LoadEvent;
+  resources: ResourceSnapshot[];
+};
 
 export type PageEntry = {
-  created: trace.PageCreatedTraceEvent;
-  destroyed: trace.PageDestroyedTraceEvent;
-  actions: ActionEntry[];
-  interestingEvents: InterestingPageEvent[];
+  actions: trace.ActionTraceEvent[];
+  events: trace.ActionTraceEvent[];
+  objects: { [ket: string]: any };
   screencastFrames: {
     sha1: string,
     timestamp: number,
     width: number,
     height: number,
   }[]
-}
-
-export type ActionEntry = trace.ActionTraceEvent & {
-  actionId: string;
-  resources: ResourceSnapshot[]
 };
 
 export class PersistentSnapshotStorage extends BaseSnapshotStorage {

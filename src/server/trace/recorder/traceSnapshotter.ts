@@ -17,16 +17,12 @@
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
-import util from 'util';
 import { BrowserContext } from '../../browserContext';
 import { Page } from '../../page';
 import { FrameSnapshot, ResourceSnapshot } from '../../snapshot/snapshotTypes';
 import { Snapshotter, SnapshotterBlob, SnapshotterDelegate } from '../../snapshot/snapshotter';
 import { ElementHandle } from '../../dom';
 import { TraceEvent } from '../common/traceEvents';
-import { monotonicTime } from '../../../utils/utils';
-
-const fsWriteFileAsync = util.promisify(fs.writeFile.bind(fs));
 
 export class TraceSnapshotter extends EventEmitter implements SnapshotterDelegate {
   private _snapshotter: Snapshotter;
@@ -50,6 +46,11 @@ export class TraceSnapshotter extends EventEmitter implements SnapshotterDelegat
     await this._snapshotter.start();
   }
 
+  async stop(): Promise<void> {
+    await this._snapshotter.stop();
+    await this._writeArtifactChain;
+  }
+
   async dispose() {
     this._snapshotter.dispose();
     await this._writeArtifactChain;
@@ -61,23 +62,15 @@ export class TraceSnapshotter extends EventEmitter implements SnapshotterDelegat
 
   onBlob(blob: SnapshotterBlob): void {
     this._writeArtifactChain = this._writeArtifactChain.then(async () => {
-      await fsWriteFileAsync(path.join(this._resourcesDir, blob.sha1), blob.buffer).catch(() => {});
+      await fs.promises.writeFile(path.join(this._resourcesDir, blob.sha1), blob.buffer).catch(() => {});
     });
   }
 
   onResourceSnapshot(snapshot: ResourceSnapshot): void {
-    this._appendTraceEvent({
-      timestamp: monotonicTime(),
-      type: 'resource-snapshot',
-      snapshot,
-    });
+    this._appendTraceEvent({ type: 'resource-snapshot', snapshot });
   }
 
   onFrameSnapshot(snapshot: FrameSnapshot): void {
-    this._appendTraceEvent({
-      timestamp: monotonicTime(),
-      type: 'frame-snapshot',
-      snapshot,
-    });
+    this._appendTraceEvent({ type: 'frame-snapshot', snapshot });
   }
 }

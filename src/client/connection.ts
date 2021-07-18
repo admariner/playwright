@@ -34,10 +34,11 @@ import * as channels from '../protocol/channels';
 import { Stream } from './stream';
 import { debugLogger } from '../utils/debugLogger';
 import { SelectorsOwner } from './selectors';
-import { isUnderTest } from '../utils/utils';
 import { Android, AndroidSocket, AndroidDevice } from './android';
-import { captureStackTrace } from '../utils/stackTrace';
+import { SocksSocket } from './socksSocket';
+import { ParsedStackTrace } from '../utils/stackTrace';
 import { Artifact } from './artifact';
+import { EventEmitter } from 'events';
 
 class Root extends ChannelOwner<channels.Channel, {}> {
   constructor(connection: Connection) {
@@ -45,16 +46,20 @@ class Root extends ChannelOwner<channels.Channel, {}> {
   }
 }
 
-export class Connection {
+export class Connection extends EventEmitter {
   readonly _objects = new Map<string, ChannelOwner>();
   private _waitingForObject = new Map<string, any>();
   onmessage = (message: object): void => {};
   private _lastId = 0;
-  private _callbacks = new Map<number, { resolve: (a: any) => void, reject: (a: Error) => void }>();
+  private _callbacks = new Map<number, { resolve: (a: any) => void, reject: (a: Error) => void, metadata: channels.Metadata }>();
   private _rootObject: ChannelOwner;
+  private _disconnectedErrorMessage: string | undefined;
+  private _onClose?: () => void;
 
-  constructor() {
+  constructor(onClose?: () => void) {
+    super();
     this._rootObject = new Root(this);
+    this._onClose = onClose;
   }
 
   async waitForObjectWithKnownName(guid: string): Promise<any> {
@@ -63,24 +68,28 @@ export class Connection {
     return new Promise(f => this._waitingForObject.set(guid, f));
   }
 
+  pendingProtocolCalls(): channels.Metadata[] {
+    return Array.from(this._callbacks.values()).map(callback => callback.metadata);
+  }
+
   getObjectWithKnownName(guid: string): any {
     return this._objects.get(guid)!;
   }
 
-  async sendMessageToServer(guid: string, method: string, params: any, apiName: string | undefined): Promise<any> {
-    const { stack, frames } = captureStackTrace();
+  async sendMessageToServer(object: ChannelOwner, method: string, params: any, stackTrace: ParsedStackTrace | null): Promise<any> {
+    const guid = object._guid;
+    const { frames, apiName }: ParsedStackTrace = stackTrace || { frameTexts: [], frames: [], apiName: '' };
+
     const id = ++this._lastId;
     const converted = { id, guid, method, params };
     // Do not include metadata in debug logs to avoid noise.
     debugLogger.log('channel:command', converted);
-    this.onmessage({ ...converted, metadata: { stack: frames, apiName } });
-    try {
-      return await new Promise((resolve, reject) => this._callbacks.set(id, { resolve, reject }));
-    } catch (e) {
-      const innerStack = ((process.env.PWDEBUGIMPL || isUnderTest()) && e.stack) ? e.stack.substring(e.stack.indexOf(e.message) + e.message.length) : '';
-      e.stack = e.message + innerStack + '\n' + stack;
-      throw e;
-    }
+    const metadata: channels.Metadata = { stack: frames, apiName };
+    this.onmessage({ ...converted, metadata });
+
+    if (this._disconnectedErrorMessage)
+      throw new Error(this._disconnectedErrorMessage);
+    return await new Promise((resolve, reject) => this._callbacks.set(id, { resolve, reject, metadata }));
   }
 
   _debugScopeState(): any {
@@ -118,6 +127,23 @@ export class Connection {
     if (!object)
       throw new Error(`Cannot find object to emit "${method}": ${guid}`);
     object._channel.emit(method, this._replaceGuidsWithChannels(params));
+  }
+
+  close() {
+    if (this._onClose)
+      this._onClose();
+  }
+
+  didDisconnect(errorMessage: string) {
+    this._disconnectedErrorMessage = errorMessage;
+    for (const callback of this._callbacks.values())
+      callback.reject(new Error(errorMessage));
+    this._callbacks.clear();
+    this.emit('disconnect');
+  }
+
+  isDisconnected() {
+    return !!this._disconnectedErrorMessage;
   }
 
   private _replaceGuidsWithChannels(payload: any): any {
@@ -217,6 +243,9 @@ export class Connection {
         break;
       case 'Worker':
         result = new Worker(parent, type, guid, initializer);
+        break;
+      case 'SocksSocket':
+        result = new SocksSocket(parent, type, guid, initializer);
         break;
       default:
         throw new Error('Missing type ' + type);

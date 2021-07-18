@@ -15,16 +15,18 @@
  * limitations under the License.
  */
 
+import * as channels from '../protocol/channels';
 import { ConsoleMessage } from './console';
 import * as dom from './dom';
-import { helper, RegisteredListener } from './helper';
+import { helper } from './helper';
+import { eventsHelper, RegisteredListener } from '../utils/eventsHelper';
 import * as js from './javascript';
 import * as network from './network';
 import { Page } from './page';
 import * as types from './types';
 import { BrowserContext } from './browserContext';
 import { Progress, ProgressController } from './progress';
-import { assert, makeWaitForNextTask } from '../utils/utils';
+import { assert, constructURLBasedOnBaseURL, makeWaitForNextTask } from '../utils/utils';
 import { debugLogger } from '../utils/debugLogger';
 import { CallMetadata, internalCallMetadata, SdkObject } from './instrumentation';
 import { ElementStateWithoutStable } from './injected/injectedScript';
@@ -263,6 +265,7 @@ export class FrameManager {
         route.continue();
       return;
     }
+    this._page._browserContext.emit(BrowserContext.Events.Request, request);
     this._page._requestStarted(request);
   }
 
@@ -270,13 +273,14 @@ export class FrameManager {
     if (response.request()._isFavicon)
       return;
     this._responses.push(response);
-    this._page.emit(Page.Events.Response, response);
+    this._page._browserContext.emit(BrowserContext.Events.Response, response);
   }
 
   requestFinished(request: network.Request) {
     this._inflightRequestFinished(request);
-    if (!request._isFavicon)
-      this._page.emit(Page.Events.RequestFinished, request);
+    if (request._isFavicon)
+      return;
+    this._page._browserContext.emit(BrowserContext.Events.RequestFinished, request);
   }
 
   requestFailed(request: network.Request, canceled: boolean) {
@@ -288,8 +292,9 @@ export class FrameManager {
         errorText += '; maybe frame was detached?';
       this.frameAbortedNavigation(frame._id, errorText, frame.pendingDocument()!.documentId);
     }
-    if (!request._isFavicon)
-      this._page.emit(Page.Events.RequestFailed, request);
+    if (request._isFavicon)
+      return;
+    this._page._browserContext.emit(BrowserContext.Events.RequestFailed, request);
   }
 
   removeChildFramesRecursively(frame: Frame) {
@@ -491,6 +496,26 @@ export class Frame extends SdkObject {
     }
   }
 
+  async nonStallingEvaluateInExistingContext(expression: string, isFunction: boolean|undefined, world: types.World): Promise<any> {
+    if (this._pendingDocument)
+      throw new Error('Frame is currently attempting a navigation');
+    const context = this._contextData.get(world)?.context;
+    if (!context)
+      throw new Error('Frame does not yet have the execution context');
+
+    let callback = () => {};
+    const frameInvalidated = new Promise<void>((f, r) => callback = r);
+    this._nonStallingEvaluations.add(callback);
+    try {
+      return await Promise.race([
+        context.evaluateExpression(expression, isFunction),
+        frameInvalidated
+      ]);
+    } finally {
+      this._nonStallingEvaluations.delete(callback);
+    }
+  }
+
   private _recalculateLifecycle() {
     const events = new Set<types.LifecycleEvent>(this._firedLifecycleEvents);
     for (const child of this._childFrames) {
@@ -532,8 +557,9 @@ export class Frame extends SdkObject {
   }
 
   async goto(metadata: CallMetadata, url: string, options: types.GotoOptions = {}): Promise<network.Response | null> {
+    const constructedNavigationURL = constructURLBasedOnBaseURL(this._page._browserContext._options.baseURL, url);
     const controller = new ProgressController(metadata, this);
-    return controller.run(progress => this._goto(progress, url, options), this._page._timeoutSettings.navigationTimeout(options));
+    return controller.run(progress => this._goto(progress, constructedNavigationURL, options), this._page._timeoutSettings.navigationTimeout(options));
   }
 
   private async _goto(progress: Progress, url: string, options: types.GotoOptions): Promise<network.Response | null> {
@@ -657,6 +683,7 @@ export class Frame extends SdkObject {
   }
 
   async $(selector: string): Promise<dom.ElementHandle<Element> | null> {
+    debugLogger.log('api', `    finding element using the selector "${selector}"`);
     return this._page.selectors._query(this, selector);
   }
 
@@ -673,13 +700,26 @@ export class Frame extends SdkObject {
     const task = dom.waitForSelectorTask(info, state);
     return controller.run(async progress => {
       progress.log(`waiting for selector "${selector}"${state === 'attached' ? '' : ' to be ' + state}`);
-      const result = await this._scheduleRerunnableHandleTask(progress, info.world, task);
-      if (!result.asElement()) {
-        result.dispose();
-        return null;
+      while (progress.isRunning()) {
+        const result = await this._scheduleRerunnableHandleTask(progress, info.world, task);
+        if (!result.asElement()) {
+          result.dispose();
+          return null;
+        }
+        if ((options as any).__testHookBeforeAdoptNode)
+          await (options as any).__testHookBeforeAdoptNode();
+        try {
+          const handle = result.asElement() as dom.ElementHandle<Element>;
+          const adopted = await handle._adoptTo(await this._mainContext());
+          return adopted;
+        } catch (e) {
+          // Navigated while trying to adopt the node.
+          if (!js.isContextDestroyedError(e) && !e.message.includes(dom.kUnableToAdoptErrorMessage))
+            throw e;
+          result.dispose();
+        }
       }
-      const handle = result.asElement() as dom.ElementHandle<Element>;
-      return handle._adoptTo(await this._mainContext());
+      return null;
     }, this._page._timeoutSettings.timeout(options));
   }
 
@@ -877,7 +917,7 @@ export class Frame extends SdkObject {
       resolve();
     });
     const errorPromise = new Promise<void>(resolve => {
-      listeners.push(helper.addEventListener(this._page, Page.Events.Console, (message: ConsoleMessage) => {
+      listeners.push(eventsHelper.addEventListener(this._page, Page.Events.Console, (message: ConsoleMessage) => {
         if (message.type() === 'error' && message.text().includes('Content Security Policy')) {
           cspMessage = message;
           resolve();
@@ -885,7 +925,7 @@ export class Frame extends SdkObject {
       }));
     });
     await Promise.race([actionPromise, errorPromise]);
-    helper.removeEventListeners(listeners);
+    eventsHelper.removeEventListeners(listeners);
     if (cspMessage)
       throw new Error(cspMessage.text());
     if (error)
@@ -949,7 +989,7 @@ export class Frame extends SdkObject {
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async fill(metadata: CallMetadata, selector: string, value: string, options: types.NavigatingActionWaitOptions) {
+  async fill(metadata: CallMetadata, selector: string, value: string, options: types.NavigatingActionWaitOptions & { force?: boolean }) {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._fill(progress, value, options)));
@@ -1003,6 +1043,16 @@ export class Frame extends SdkObject {
     }, this._page._timeoutSettings.timeout(options));
   }
 
+  async inputValue(metadata: CallMetadata, selector: string, options: types.TimeoutOptions = {}): Promise<string> {
+    const controller = new ProgressController(metadata, this);
+    const info = this._page.selectors._parseSelector(selector);
+    const task = dom.inputValueTask(info);
+    return controller.run(async progress => {
+      progress.log(`  retrieving value from "${selector}"`);
+      return dom.throwFatalDOMError(await this._scheduleRerunnableTask(progress, info.world, task));
+    }, this._page._timeoutSettings.timeout(options));
+  }
+
   private async _checkElementState(metadata: CallMetadata, selector: string, state: ElementStateWithoutStable, options: types.TimeoutOptions = {}): Promise<boolean> {
     const controller = new ProgressController(metadata, this);
     const info = this._page.selectors._parseSelector(selector);
@@ -1050,14 +1100,14 @@ export class Frame extends SdkObject {
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async selectOption(metadata: CallMetadata, selector: string, elements: dom.ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions = {}): Promise<string[]> {
+  async selectOption(metadata: CallMetadata, selector: string, elements: dom.ElementHandle[], values: types.SelectOption[], options: types.NavigatingActionWaitOptions & types.ForceOptions = {}): Promise<string[]> {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       return await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._selectOption(progress, elements, values, options));
     }, this._page._timeoutSettings.timeout(options));
   }
 
-  async setInputFiles(metadata: CallMetadata, selector: string, files: types.FilePayload[], options: types.NavigatingActionWaitOptions = {}): Promise<void> {
+  async setInputFiles(metadata: CallMetadata, selector: string, files: channels.ElementHandleSetInputFilesParams['files'], options: types.NavigatingActionWaitOptions = {}): Promise<void> {
     const controller = new ProgressController(metadata, this);
     return controller.run(async progress => {
       return dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, handle => handle._setInputFiles(progress, files, options)));
@@ -1216,9 +1266,9 @@ export class Frame extends SdkObject {
     this._networkIdleTimer = undefined;
   }
 
-  async extendInjectedScript(source: string, arg?: any): Promise<js.JSHandle> {
-    const mainContext = await this._mainContext();
-    const injectedScriptHandle = await mainContext.injectedScript();
+  async extendInjectedScript(world: types.World, source: string, arg?: any): Promise<js.JSHandle> {
+    const context = await this._context(world);
+    const injectedScriptHandle = await context.injectedScript();
     return injectedScriptHandle.evaluateHandle((injectedScript, {source, arg}) => {
       return injectedScript.extend(source, arg);
     }, { source, arg });
@@ -1259,16 +1309,9 @@ class RerunnableTask {
       this._contextData.rerunnableTasks.delete(this);
       this._resolve(result);
     } catch (e) {
-      // When the page is navigated, the promise is rejected.
       // We will try again in the new execution context.
-      if (e.message.includes('Execution context was destroyed'))
+      if (js.isContextDestroyedError(e))
         return;
-
-      // We could have tried to evaluate in a context which was already
-      // destroyed.
-      if (e.message.includes('Cannot find context with specified id'))
-        return;
-
       this._contextData.rerunnableTasks.delete(this);
       this._reject(e);
     }

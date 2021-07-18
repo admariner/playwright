@@ -16,7 +16,7 @@
  */
 
 import { browserTest as it, expect } from './config/browserTest';
-import { verifyViewport } from './config/utils';
+import { attachFrame, verifyViewport } from './config/utils';
 
 it('should create new context', async function({browser}) {
   expect(browser.contexts().length).toBe(0);
@@ -188,14 +188,14 @@ it('should close all belonging pages once closing context', async function({brow
   expect(context.pages().length).toBe(0);
 });
 
-it('should disable javascript', async ({browser, isWebKit}) => {
+it('should disable javascript', async ({browser, browserName}) => {
   {
     const context = await browser.newContext({ javaScriptEnabled: false });
     const page = await context.newPage();
     await page.goto('data:text/html, <script>var something = "forbidden"</script>');
     let error = null;
     await page.evaluate('something').catch(e => error = e);
-    if (isWebKit)
+    if (browserName === 'webkit')
       expect(error.message).toContain('Can\'t find variable: something');
     else
       expect(error.message).toContain('something is not defined');
@@ -239,4 +239,39 @@ it('should emulate navigator.onLine', async ({browser, server}) => {
   await context.setOffline(false);
   expect(await page.evaluate(() => window.navigator.onLine)).toBe(true);
   await context.close();
+});
+
+it('should emulate media in popup', async ({browser, server}) => {
+  {
+    const context = await browser.newContext({ colorScheme: 'dark' });
+    const page = await context.newPage();
+    await page.goto(server.EMPTY_PAGE);
+    const [popup] = await Promise.all([
+      page.waitForEvent('popup'),
+      page.evaluate(url => { window.open(url); }, server.EMPTY_PAGE),
+    ]);
+    expect(await popup.evaluate(() => matchMedia('(prefers-color-scheme: light)').matches)).toBe(false);
+    expect(await popup.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches)).toBe(true);
+    await context.close();
+  }
+  {
+    const page = await browser.newPage({ colorScheme: 'light' });
+    await page.goto(server.EMPTY_PAGE);
+    const [popup] = await Promise.all([
+      page.waitForEvent('popup'),
+      page.evaluate(url => { window.open(url); }, server.EMPTY_PAGE),
+    ]);
+    expect(await popup.evaluate(() => matchMedia('(prefers-color-scheme: light)').matches)).toBe(true);
+    expect(await popup.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches)).toBe(false);
+    await page.close();
+  }
+});
+
+it('should emulate media in cross-process iframe', async ({browser, server}) => {
+  const page = await browser.newPage({ colorScheme: 'dark' });
+  await page.goto(server.EMPTY_PAGE);
+  await attachFrame(page, 'frame1', server.CROSS_PROCESS_PREFIX + '/empty.html');
+  const frame = page.frames()[1];
+  expect(await frame.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches)).toBe(true);
+  await page.close();
 });

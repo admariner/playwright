@@ -21,11 +21,12 @@ import { BrowserTypeDispatcher } from './browserTypeDispatcher';
 import { Dispatcher, DispatcherScope } from './dispatcher';
 import { ElectronDispatcher } from './electronDispatcher';
 import { SelectorsDispatcher } from './selectorsDispatcher';
-import type { BrowserDispatcher } from './browserDispatcher';
 import * as types from '../server/types';
+import { SocksSocketDispatcher } from './socksSocketDispatcher';
+import { SocksInterceptedSocketHandler } from '../server/socksServer';
 
 export class PlaywrightDispatcher extends Dispatcher<Playwright, channels.PlaywrightInitializer> implements channels.PlaywrightChannel {
-  constructor(scope: DispatcherScope, playwright: Playwright, customSelectors?: SelectorsDispatcher, preLaunchedBrowser?: BrowserDispatcher) {
+  constructor(scope: DispatcherScope, playwright: Playwright, customSelectors?: channels.SelectorsChannel, preLaunchedBrowser?: channels.BrowserChannel) {
     const descriptors = require('../server/deviceDescriptors') as types.Devices;
     const deviceDescriptors = Object.entries(descriptors)
         .map(([name, descriptor]) => ({ name, descriptor }));
@@ -39,5 +40,12 @@ export class PlaywrightDispatcher extends Dispatcher<Playwright, channels.Playwr
       selectors: customSelectors || new SelectorsDispatcher(scope, playwright.selectors),
       preLaunchedBrowser,
     }, false);
+    this._object.on('incomingSocksSocket', (socket: SocksInterceptedSocketHandler) => {
+      this._dispatchEvent('incomingSocksSocket', { socket: new SocksSocketDispatcher(this, socket) });
+    });
+  }
+
+  async setForwardedPorts(params: channels.PlaywrightSetForwardedPortsParams): Promise<void> {
+    this._object._setForwardedPorts(params.ports);
   }
 }

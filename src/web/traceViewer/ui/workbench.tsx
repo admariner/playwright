@@ -14,7 +14,8 @@
   limitations under the License.
 */
 
-import { ActionEntry, ContextEntry } from '../../../server/trace/viewer/traceModel';
+import { ActionTraceEvent } from '../../../server/trace/common/traceEvents';
+import { ContextEntry } from '../../../server/trace/viewer/traceModel';
 import { ActionList } from './actionList';
 import { TabbedPane } from './tabbedPane';
 import { Timeline } from './timeline';
@@ -24,32 +25,43 @@ import { ContextSelector } from './contextSelector';
 import { NetworkTab } from './networkTab';
 import { SourceTab } from './sourceTab';
 import { SnapshotTab } from './snapshotTab';
-import { LogsTab } from './logsTab';
+import { CallTab } from './callTab';
 import { SplitView } from '../../components/splitView';
 import { useAsyncMemo } from './helpers';
-
+import { ConsoleTab } from './consoleTab';
+import * as modelUtil from './modelUtil';
 
 export const Workbench: React.FunctionComponent<{
   debugNames: string[],
 }> = ({ debugNames }) => {
   const [debugName, setDebugName] = React.useState(debugNames[0]);
-  const [selectedAction, setSelectedAction] = React.useState<ActionEntry | undefined>();
-  const [highlightedAction, setHighlightedAction] = React.useState<ActionEntry | undefined>();
+  const [selectedAction, setSelectedAction] = React.useState<ActionTraceEvent | undefined>();
+  const [highlightedAction, setHighlightedAction] = React.useState<ActionTraceEvent | undefined>();
+  const [selectedTab, setSelectedTab] = React.useState<string>('logs');
 
   let context = useAsyncMemo(async () => {
-    return (await fetch(`/context/${debugName}`).then(response => response.json())) as ContextEntry;
+    if (!debugName)
+      return emptyContext;
+    const context = (await fetch(`/context/${debugName}`).then(response => response.json())) as ContextEntry;
+    modelUtil.indexModel(context);
+    return context;
   }, [debugName], emptyContext);
 
   const actions = React.useMemo(() => {
-    const actions: ActionEntry[] = [];
+    const actions: ActionTraceEvent[] = [];
     for (const page of context.pages)
       actions.push(...page.actions);
-    actions.sort((a, b) => a.timestamp - b.timestamp);
     return actions;
   }, [context]);
 
-  const snapshotSize = context.created.viewportSize || { width: 1280, height: 720 };
+  const snapshotSize = context.options.viewport || { width: 1280, height: 720 };
   const boundaries = { minimum: context.startTime, maximum: context.endTime };
+
+  // Leave some nice free space on the right hand side.
+  boundaries.maximum += (boundaries.maximum - boundaries.minimum) / 20;
+  const { errors, warnings } = selectedAction ? modelUtil.stats(selectedAction) : { errors: 0, warnings: 0 };
+  const consoleCount = errors + warnings;
+  const networkCount = selectedAction ? modelUtil.resourcesForAction(selectedAction).length : 0;
 
   return <div className='vbox workbench'>
     <div className='hbox header'>
@@ -77,12 +89,13 @@ export const Workbench: React.FunctionComponent<{
     </div>
     <SplitView sidebarSize={300} orientation='horizontal' sidebarIsFirst={true}>
       <SplitView sidebarSize={300} orientation='horizontal'>
-        <SnapshotTab actionEntry={selectedAction} snapshotSize={snapshotSize} />
+        <SnapshotTab action={selectedAction} snapshotSize={snapshotSize} />
         <TabbedPane tabs={[
-          { id: 'logs', title: 'Log', render: () => <LogsTab actionEntry={selectedAction} /> },
-          { id: 'source', title: 'Source', render: () => <SourceTab actionEntry={selectedAction} /> },
-          { id: 'network', title: 'Network', render: () => <NetworkTab actionEntry={selectedAction} /> },
-        ]}/>
+          { id: 'logs', title: 'Call', count: 0, render: () => <CallTab action={selectedAction} /> },
+          { id: 'console', title: 'Console', count: consoleCount, render: () => <ConsoleTab action={selectedAction} /> },
+          { id: 'network', title: 'Network', count: networkCount, render: () => <NetworkTab action={selectedAction} /> },
+          { id: 'source', title: 'Source', count: 0, render: () => <SourceTab action={selectedAction} /> },
+        ]} selectedTab={selectedTab} setSelectedTab={setSelectedTab}/>
       </SplitView>
       <ActionList
         actions={actions}
@@ -92,6 +105,7 @@ export const Workbench: React.FunctionComponent<{
           setSelectedAction(action);
         }}
         onHighlighted={action => setHighlightedAction(action)}
+        setSelectedTab={setSelectedTab}
       />
     </SplitView>
   </div>;
@@ -101,14 +115,14 @@ const now = performance.now();
 const emptyContext: ContextEntry = {
   startTime: now,
   endTime: now,
-  created: {
-    timestamp: now,
-    type: 'context-metadata',
-    browserName: '',
+  browserName: '',
+  options: {
+    sdkLanguage: '',
     deviceScaleFactor: 1,
     isMobile: false,
-    viewportSize: { width: 1280, height: 800 },
-    debugName: '<empty>',
+    viewport: { width: 1280, height: 800 },
+    _debugName: '<empty>',
   },
-  pages: []
+  pages: [],
+  resources: []
 };

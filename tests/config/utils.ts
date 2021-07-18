@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { expect } from 'folio';
+import { expect } from './test-runner';
 import type { Frame, Page } from '../../index';
 
 export async function attachFrame(page: Page, frameId: string, url: string): Promise<Frame> {
@@ -57,4 +57,16 @@ export function expectedSSLError(browserName: string): string {
     expectedSSLError = 'SSL_ERROR_UNKNOWN';
   }
   return expectedSSLError;
+}
+
+export function chromiumVersionLessThan(a: string, b: string) {
+  const left: number[] = a.split('.').map(e => Number(e));
+  const right: number[] = b.split('.').map(e => Number(e));
+  for (let i = 0; i < 4; i++) {
+    if (left[i] > right[i])
+      return false;
+    if (left[i] < right[i])
+      return true;
+  }
+  return false;
 }

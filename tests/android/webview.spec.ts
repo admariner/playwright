@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
-import { androidTest as test, expect } from '../config/androidTest';
+import { androidTest as test, expect } from './androidTest';
+
+test.afterEach(async ({ androidDevice }) => {
+  await androidDevice.shell('am force-stop org.chromium.webview_shell');
+});
 
 test('androidDevice.webView', async function({ androidDevice }) {
   expect(androidDevice.webViews().length).toBe(0);

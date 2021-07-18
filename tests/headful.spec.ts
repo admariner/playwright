@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { playwrightTest as it, slowPlaywrightTest as slowTest, expect } from './config/browserTest';
+import { playwrightTest as it, expect } from './config/browserTest';
 
 it('should have default url when launching browser', async ({browserType, browserOptions, createUserDataDir}) => {
   const browserContext = await browserType.launchPersistentContext(await createUserDataDir(), {...browserOptions, headless: false });
@@ -23,25 +23,9 @@ it('should have default url when launching browser', async ({browserType, browse
   await browserContext.close();
 });
 
-slowTest('headless should be able to read cookies written by headful', async ({browserType, browserOptions, server, createUserDataDir}) => {
-  // see https://github.com/microsoft/playwright/issues/717
-  const userDataDir = await createUserDataDir();
-  // Write a cookie in headful chrome
-  const headfulContext = await browserType.launchPersistentContext(userDataDir, {...browserOptions, headless: false});
-  const headfulPage = await headfulContext.newPage();
-  await headfulPage.goto(server.EMPTY_PAGE);
-  await headfulPage.evaluate(() => document.cookie = 'foo=true; expires=Fri, 31 Dec 9999 23:59:59 GMT');
-  await headfulContext.close();
-  // Read the cookie from headless chrome
-  const headlessContext = await browserType.launchPersistentContext(userDataDir, {...browserOptions, headless: true});
-  const headlessPage = await headlessContext.newPage();
-  await headlessPage.goto(server.EMPTY_PAGE);
-  const cookie = await headlessPage.evaluate(() => document.cookie);
-  await headlessContext.close();
-  expect(cookie).toBe('foo=true');
-});
+it('should close browser with beforeunload page', async ({browserType, browserOptions, server, createUserDataDir}) => {
+  it.slow();
 
-slowTest('should close browser with beforeunload page', async ({browserType, browserOptions, server, createUserDataDir}) => {
   const browserContext = await browserType.launchPersistentContext(await createUserDataDir(), {...browserOptions, headless: false});
   const page = await browserContext.newPage();
   await page.goto(server.PREFIX + '/beforeunload.html');
@@ -83,7 +67,7 @@ it('should close browser after context menu was triggered', async ({browserType,
   await browser.close();
 });
 
-it('should(not) block third party cookies', async ({browserType, browserOptions, server, isChromium, isFirefox}) => {
+it('should(not) block third party cookies', async ({browserType, browserOptions, server, browserName}) => {
   const browser = await browserType.launch({...browserOptions, headless: false });
   const page = await browser.newPage();
   await page.goto(server.EMPTY_PAGE);
@@ -101,7 +85,7 @@ it('should(not) block third party cookies', async ({browserType, browserOptions,
     return document.cookie;
   });
   await page.waitForTimeout(2000);
-  const allowsThirdParty = isChromium || isFirefox;
+  const allowsThirdParty = browserName === 'chromium' || browserName === 'firefox';
   expect(documentCookie).toBe(allowsThirdParty ? 'username=John Doe' : '');
   const cookies = await page.context().cookies(server.CROSS_PROCESS_PREFIX + '/grid.html');
   if (allowsThirdParty) {
@@ -163,30 +147,3 @@ it('Page.bringToFront should work', async ({browserType, browserOptions}) => {
   await browser.close();
 });
 
-it('focused input should produce the same screenshot', async ({browserType, browserOptions, browserName, platform, browserChannel}, testInfo) => {
-  it.fail(browserName === 'firefox' && platform === 'darwin', 'headless has thinner outline');
-  it.fail(browserName === 'firefox' && platform === 'linux', 'headless has no outline');
-  it.fail(browserName === 'firefox' && platform === 'win32', 'headless has outline since new version');
-  it.skip(browserName === 'webkit' && platform === 'linux', 'gtk vs wpe');
-  it.skip(!!process.env.CRPATH);
-  it.skip(!!browserChannel, 'Uncomment on roll');
-
-  testInfo.snapshotPathSegment = browserName + '-' + platform;
-
-  const headful = await browserType.launch({...browserOptions, headless: false });
-  const headfulPage = await headful.newPage();
-  await headfulPage.setContent('<input>');
-  await headfulPage.focus('input');
-  const headfulScreenshot = await headfulPage.screenshot();
-  await headful.close();
-
-  const headless = await browserType.launch({...browserOptions, headless: true });
-  const headlessPage = await headless.newPage();
-  await headlessPage.setContent('<input>');
-  await headlessPage.focus('input');
-  const headlessScreenshot = await headlessPage.screenshot();
-  await headless.close();
-
-  expect(headfulScreenshot).toMatchSnapshot('focused-input.png');
-  expect(headlessScreenshot).toMatchSnapshot('focused-input.png');
-});

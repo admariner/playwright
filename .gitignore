@@ -7,6 +7,7 @@
 *.swp
 *.pyc
 .vscode
+.idea
 yarn.lock
 /src/generated/*
 lib/
@@ -14,5 +15,5 @@ drivers/
 .android-sdk/
 .gradle/
 nohup.out
-api.json
 .trace
+.tmp

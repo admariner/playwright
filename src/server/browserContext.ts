@@ -25,7 +25,7 @@ import { helper } from './helper';
 import * as network from './network';
 import { Page, PageBinding, PageDelegate } from './page';
 import { Progress } from './progress';
-import { Selectors, serverSelectors } from './selectors';
+import { Selectors } from './selectors';
 import * as types from './types';
 import path from 'path';
 import { CallMetadata, internalCallMetadata, createInstrumentation, SdkObject } from './instrumentation';
@@ -39,6 +39,10 @@ export abstract class BrowserContext extends SdkObject {
   static Events = {
     Close: 'close',
     Page: 'page',
+    Request: 'request',
+    Response: 'response',
+    RequestFailed: 'requestfailed',
+    RequestFinished: 'requestfinished',
     BeforeClose: 'beforeclose',
     VideoStarted: 'videostarted',
   };
@@ -79,7 +83,7 @@ export abstract class BrowserContext extends SdkObject {
   }
 
   selectors(): Selectors {
-    return this._selectors || serverSelectors;
+    return this._selectors || this._browser.options.selectors;
   }
 
   async _initialize() {
@@ -104,7 +108,7 @@ export abstract class BrowserContext extends SdkObject {
     });
 
     if (debugMode() === 'console')
-      await this.extendInjectedScript(consoleApiSource.source);
+      await this.extendInjectedScript('main', consoleApiSource.source);
   }
 
   async _ensureVideosPath() {
@@ -127,6 +131,8 @@ export abstract class BrowserContext extends SdkObject {
     this._closedStatus = 'closed';
     this._deleteAllDownloads();
     this._downloads.clear();
+    if (this._isPersistentContext)
+      this._onClosePersistent();
     this._closePromiseFulfill!(new Error('Context closed'));
     this.emit(BrowserContext.Events.Close);
   }
@@ -147,6 +153,8 @@ export abstract class BrowserContext extends SdkObject {
   abstract _doExposeBinding(binding: PageBinding): Promise<void>;
   abstract _doUpdateRequestInterception(): Promise<void>;
   abstract _doClose(): Promise<void>;
+  abstract _onClosePersistent(): void;
+  abstract _doCancelDownload(uuid: string): Promise<void>;
 
   async cookies(urls: string | string[] | undefined = []): Promise<types.NetworkCookie[]> {
     if (urls && !Array.isArray(urls))
@@ -158,15 +166,15 @@ export abstract class BrowserContext extends SdkObject {
     return this._doSetHTTPCredentials(httpCredentials);
   }
 
-  async exposeBinding(name: string, needsHandle: boolean, playwrightBinding: frames.FunctionWithSource): Promise<void> {
-    const identifier = PageBinding.identifier(name, 'main');
+  async exposeBinding(name: string, needsHandle: boolean, playwrightBinding: frames.FunctionWithSource, world: types.World): Promise<void> {
+    const identifier = PageBinding.identifier(name, world);
     if (this._pageBindings.has(identifier))
       throw new Error(`Function "${name}" has been already registered`);
     for (const page of this.pages()) {
-      if (page.getBinding(name, 'main'))
+      if (page.getBinding(name, world))
         throw new Error(`Function "${name}" has been already registered in one of the pages`);
     }
-    const binding = new PageBinding(name, playwrightBinding, needsHandle, 'main');
+    const binding = new PageBinding(name, playwrightBinding, needsHandle, world);
     this._pageBindings.set(identifier, binding);
     await this._doExposeBinding(binding);
   }
@@ -363,8 +371,8 @@ export abstract class BrowserContext extends SdkObject {
     }
   }
 
-  async extendInjectedScript(source: string, arg?: any) {
-    const installInFrame = (frame: frames.Frame) => frame.extendInjectedScript(source, arg).catch(() => {});
+  async extendInjectedScript(world: types.World, source: string, arg?: any) {
+    const installInFrame = (frame: frames.Frame) => frame.extendInjectedScript(world, source, arg).catch(() => {});
     const installInPage = (page: Page) => {
       page.on(Page.Events.InternalFrameNavigatedToNewDocument, installInFrame);
       return Promise.all(page.frames().map(installInFrame));

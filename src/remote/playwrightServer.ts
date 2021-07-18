@@ -20,39 +20,47 @@ import * as ws from 'ws';
 import { DispatcherConnection, DispatcherScope } from '../dispatchers/dispatcher';
 import { PlaywrightDispatcher } from '../dispatchers/playwrightDispatcher';
 import { createPlaywright } from '../server/playwright';
-import { gracefullyCloseAll } from '../server/processLauncher';
-import { serverSelectors } from '../server/selectors';
+import { gracefullyCloseAll } from '../utils/processLauncher';
 
 const debugLog = debug('pw:server');
 
 export interface PlaywrightServerDelegate {
   path: string;
   allowMultipleClients: boolean;
-  onConnect(rootScope: DispatcherScope): () => any;
+  onConnect(rootScope: DispatcherScope, forceDisconnect: () => void): Promise<() => any>;
   onClose: () => any;
 }
+
+export type PlaywrightServerOptions = {
+  acceptForwardedPorts?: boolean
+};
 
 export class PlaywrightServer {
   private _wsServer: ws.Server | undefined;
   private _clientsCount = 0;
   private _delegate: PlaywrightServerDelegate;
 
-  static async startDefault(port: number = 0): Promise<string> {
+  static async startDefault({ acceptForwardedPorts }: PlaywrightServerOptions = {}): Promise<PlaywrightServer> {
     const cleanup = async () => {
       await gracefullyCloseAll().catch(e => {});
-      serverSelectors.unregisterAll();
     };
     const delegate: PlaywrightServerDelegate = {
       path: '/ws',
       allowMultipleClients: false,
       onClose: cleanup,
-      onConnect: (rootScope: DispatcherScope) => {
-        new PlaywrightDispatcher(rootScope, createPlaywright());
-        return cleanup;
+      onConnect: async (rootScope: DispatcherScope) => {
+        const playwright = createPlaywright();
+        if (acceptForwardedPorts)
+          await playwright._enablePortForwarding();
+        new PlaywrightDispatcher(rootScope, playwright);
+        return () => {
+          cleanup();
+          playwright._disablePortForwarding();
+          playwright.selectors.unregisterAll();
+        };
       },
     };
-    const server = new PlaywrightServer(delegate);
-    return server.listen(port);
+    return new PlaywrightServer(delegate);
   }
 
   constructor(delegate: PlaywrightServerDelegate) {
@@ -66,12 +74,12 @@ export class PlaywrightServer {
     server.on('error', error => debugLog(error));
 
     const path = this._delegate.path;
-    const wsEndpoint = await new Promise<string>(resolve => {
+    const wsEndpoint = await new Promise<string>((resolve, reject) => {
       server.listen(port, () => {
         const address = server.address();
         const wsEndpoint = typeof address === 'string' ? `${address}${path}` : `ws://127.0.0.1:${address.port}${path}`;
         resolve(wsEndpoint);
-      });
+      }).on('error', reject);
     });
 
     debugLog('Listening at ' + wsEndpoint);
@@ -94,9 +102,10 @@ export class PlaywrightServer {
         connection.dispatch(JSON.parse(Buffer.from(message).toString()));
       });
 
+      const forceDisconnect = () => socket.close();
       const scope = connection.rootDispatcher();
-      const onDisconnect = this._delegate.onConnect(scope);
-      const disconnect = () => {
+      let onDisconnect = () => {};
+      const disconnected = () => {
         this._clientsCount--;
         // Avoid sending any more messages over closed socket.
         connection.onmessage = () => {};
@@ -104,12 +113,13 @@ export class PlaywrightServer {
       };
       socket.on('close', () => {
         debugLog('Client closed');
-        disconnect();
+        disconnected();
       });
       socket.on('error', error => {
         debugLog('Client error ' + error);
-        disconnect();
+        disconnected();
       });
+      onDisconnect = await this._delegate.onConnect(scope, forceDisconnect);
     });
 
     return wsEndpoint;
@@ -122,6 +132,7 @@ export class PlaywrightServer {
     // First disconnect all remaining clients.
     await new Promise(f => this._wsServer!.close(f));
     await new Promise(f => this._wsServer!.options.server!.close(f));
+    this._wsServer = undefined;
     await this._delegate.onClose();
   }
 }

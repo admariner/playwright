@@ -15,12 +15,9 @@
  * limitations under the License.
  */
 
-import { test as it, expect } from './config/pageTest';
+import { contextTest as it, expect } from './config/browserTest';
 import { browserTest } from './config/browserTest';
 import { verifyViewport } from './config/utils';
-
-it.skip(({ isAndroid }) => isAndroid, 'Default viewport is null');
-it.skip(({ isElectron }) => isElectron, 'Default viewport is null');
 
 it('should get the proper default viewport size', async ({page, server}) => {
   await verifyViewport(page, 1280, 720);
@@ -113,4 +110,15 @@ browserTest('should report null viewportSize when given null viewport', async ({
   const page = await context.newPage();
   expect(page.viewportSize()).toBe(null);
   await context.close();
+});
+
+browserTest('should drag with high dpi', async ({ browser, server}) => {
+  const page = await browser.newPage({ deviceScaleFactor: 2 });
+  await page.goto(server.PREFIX + '/drag-n-drop.html');
+  await page.hover('#source');
+  await page.mouse.down();
+  await page.hover('#target');
+  await page.mouse.up();
+  expect(await page.$eval('#target', target => target.contains(document.querySelector('#source')))).toBe(true); // could not find source in target
+  await page.close();
 });

@@ -14,60 +14,61 @@
  * limitations under the License.
  */
 
-import * as folio from 'folio';
+import type { Config } from '../config/test-runner';
 import * as path from 'path';
-import { test as pageTest } from './pageTest';
-import { AndroidEnv, androidTest } from './androidTest';
-import type { BrowserContext } from '../../index';
+import { test as pageTest } from '../page/pageTest';
+import { androidFixtures } from '../android/androidTest';
+import { PlaywrightOptions } from './browserTest';
+import { CommonOptions } from './baseTest';
 
-const config: folio.Config = {
-  testDir: path.join(__dirname, '..'),
-  outputDir: path.join(__dirname, '..', '..', 'test-results'),
+const outputDir = path.join(__dirname, '..', '..', 'test-results');
+const testDir = path.join(__dirname, '..');
+const config: Config<CommonOptions & PlaywrightOptions> = {
+  testDir,
+  outputDir,
   timeout: 120000,
   globalTimeout: 7200000,
   workers: 1,
+  forbidOnly: !!process.env.CI,
+  preserveOutput: process.env.CI ? 'failures-only' : 'always',
+  retries: process.env.CI ? 1 : 0,
+  reporter: process.env.CI ? [
+    [ 'dot' ],
+    [ 'json', { outputFile: path.join(outputDir, 'report.json') } ],
+  ] : 'line',
+  projects: [],
 };
-if (process.env.CI) {
-  config.forbidOnly = true;
-  config.retries = 1;  // Multiple retries are too slow on Android.
-}
-folio.setConfig(config);
 
-if (process.env.CI) {
-  folio.setReporters([
-    new folio.reporters.dot(),
-    new folio.reporters.json({ outputFile: path.join(__dirname, '..', '..', 'test-results', 'report.json') }),
-  ]);
-}
+const metadata = {
+  platform: 'Android',
+  headful: false,
+  browserName: 'chromium',
+  channel: 'chrome',
+  mode: 'default',
+  video: false,
+};
 
-class AndroidPageEnv extends AndroidEnv {
-  private _context?: BrowserContext;
-
-  async beforeAll(args: any, workerInfo: folio.WorkerInfo) {
-    await super.beforeAll(args, workerInfo);
-    this._context = await this._device!.launchBrowser();
-  }
-
-  async beforeEach(args: any, testInfo: folio.TestInfo) {
-    const result = await super.beforeEach(args, testInfo);
-    const page = await this._context!.newPage();
-    return { ...result, browserVersion: this._browserVersion, browserMajorVersion: this._browserMajorVersion, page, isAndroid: true, isElectron: false };
-  }
-
-  async afterEach({}, testInfo: folio.TestInfo) {
-    for (const page of this._context!.pages())
-      await page.close();
-  }
-}
-
-const envConfig = {
-  tag: 'android',
-  options: {
-    mode: 'default' as const,
-    browserName: 'chromium' as const,
+config.projects.push({
+  name: 'android',
+  use: {
     loopback: '10.0.2.2',
-  }
-};
+    mode: 'default',
+    browserName: 'chromium',
+  },
+  testDir: path.join(testDir, 'android'),
+  metadata,
+});
 
-pageTest.runWith(envConfig, new AndroidPageEnv());
-androidTest.runWith(envConfig);
+config.projects.push({
+  name: 'android',
+  use: {
+    loopback: '10.0.2.2',
+    mode: 'default',
+    browserName: 'chromium',
+  },
+  testDir: path.join(testDir, 'page'),
+  define: { test: pageTest, fixtures: androidFixtures },
+  metadata,
+});
+
+export default config;

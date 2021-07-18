@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { playwrightTest as it, slowPlaywrightTest as slowTest, expect } from './config/browserTest';
+import { playwrightTest as it, expect } from './config/browserTest';
 import fs from 'fs';
 
 it('should support hasTouch option', async ({server, launchPersistent}) => {
@@ -38,7 +38,13 @@ it('should support colorScheme option', async ({launchPersistent}) => {
   expect(await page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches)).toBe(true);
 });
 
-it('should support timezoneId option', async ({launchPersistent}) => {
+it('should support reducedMotion option', async ({launchPersistent}) => {
+  const {page} = await launchPersistent({reducedMotion: 'reduce'});
+  expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)).toBe(true);
+  expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: no-preference)').matches)).toBe(false);
+});
+
+it('should support timezoneId option', async ({launchPersistent, browserName}) => {
   const {page} = await launchPersistent({locale: 'en-US', timezoneId: 'America/Jamaica'});
   expect(await page.evaluate(() => new Date(1479579154987).toString())).toBe('Sat Nov 19 2016 13:12:34 GMT-0500 (Eastern Standard Time)');
 });
@@ -82,7 +88,9 @@ it('should accept userDataDir', async ({createUserDataDir, browserType, browserO
   expect(fs.readdirSync(userDataDir).length).toBeGreaterThan(0);
 });
 
-slowTest('should restore state from userDataDir', async ({browserType, browserOptions, server, createUserDataDir}) => {
+it('should restore state from userDataDir', async ({browserType, browserOptions, server, createUserDataDir}) => {
+  it.slow();
+
   const userDataDir = await createUserDataDir();
   const browserContext = await browserType.launchPersistentContext(userDataDir, browserOptions);
   const page = await browserContext.newPage();
@@ -104,8 +112,9 @@ slowTest('should restore state from userDataDir', async ({browserType, browserOp
   await browserContext3.close();
 });
 
-slowTest('should restore cookies from userDataDir', async ({browserType, browserOptions,  server, createUserDataDir, platform, browserChannel}) => {
-  slowTest.fixme(platform === 'win32' && browserChannel === 'chrome');
+it('should restore cookies from userDataDir', async ({browserType, browserOptions,  server, createUserDataDir, platform, channel}) => {
+  it.fixme(platform === 'win32' && channel === 'chrome');
+  it.slow();
 
   const userDataDir = await createUserDataDir();
   const browserContext = await browserType.launchPersistentContext(userDataDir, browserOptions);
@@ -146,14 +155,14 @@ it('should throw if page argument is passed', async ({browserType, browserOption
   expect(error.message).toContain('can not specify page');
 });
 
-it('should have passed URL when launching with ignoreDefaultArgs: true', async ({browserType, browserOptions, server, createUserDataDir, toImpl, mode, isFirefox}) => {
+it('should have passed URL when launching with ignoreDefaultArgs: true', async ({browserType, browserOptions, server, createUserDataDir, toImpl, mode, browserName}) => {
   it.skip(mode !== 'default');
 
   const userDataDir = await createUserDataDir();
   const args = toImpl(browserType)._defaultArgs(browserOptions, 'persistent', userDataDir, 0).filter(a => a !== 'about:blank');
   const options = {
     ...browserOptions,
-    args: isFirefox ? [...args, '-new-tab', server.EMPTY_PAGE] : [...args, server.EMPTY_PAGE],
+    args: browserName === 'firefox' ? [...args, '-new-tab', server.EMPTY_PAGE] : [...args, server.EMPTY_PAGE],
     ignoreDefaultArgs: true,
   };
   const browserContext = await browserType.launchPersistentContext(userDataDir, options);

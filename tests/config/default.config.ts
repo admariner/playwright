@@ -14,32 +14,11 @@
  * limitations under the License.
  */
 
-import * as folio from 'folio';
+import type { Config } from './test-runner';
 import * as path from 'path';
-import { playwrightTest, slowPlaywrightTest, contextTest, tracingTest } from './browserTest';
-import { test as pageTest } from './pageTest';
-import { BrowserName, CommonArgs } from './baseTest';
-import type { Browser, BrowserContext } from '../../index';
-
-const config: folio.Config = {
-  testDir: path.join(__dirname, '..'),
-  outputDir: path.join(__dirname, '..', '..', 'test-results'),
-  timeout: process.env.PWTEST_VIDEO || process.env.PWTRACE ? 60000 : 30000,
-  globalTimeout: 5400000,
-};
-if (process.env.CI) {
-  config.workers = 1;
-  config.forbidOnly = true;
-  config.retries = 3;
-}
-folio.setConfig(config);
-
-if (process.env.CI) {
-  folio.setReporters([
-    new folio.reporters.dot(),
-    new folio.reporters.json({ outputFile: path.join(__dirname, '..', '..', 'test-results', 'report.json') }),
-  ]);
-}
+import { PlaywrightOptions, playwrightFixtures } from './browserTest';
+import { test as pageTest } from '../page/pageTest';
+import { BrowserName, CommonOptions } from './baseTest';
 
 const getExecutablePath = (browserName: BrowserName) => {
   if (browserName === 'chromium' && process.env.CRPATH)
@@ -50,78 +29,70 @@ const getExecutablePath = (browserName: BrowserName) => {
     return process.env.WKPATH;
 };
 
-type WorkerOptionsFor<T> = T extends folio.TestType<infer T, infer W, infer TO, infer WO> ? WO : any;
-type AllOptions = WorkerOptionsFor<typeof contextTest>;
+const pageFixtures = {
+  ...playwrightFixtures,
+  browserMajorVersion: async ({  browserVersion }, run) => {
+    await run(Number(browserVersion.split('.')[0]));
+  },
+  isAndroid: false,
+  isElectron: false,
+};
 
-class PageEnv {
-  private _browser: Browser
-  private _browserVersion: string;
-  private _browserMajorVersion: number;
-  private _context: BrowserContext | undefined;
+const mode = (process.env.PWTEST_MODE || 'default') as ('default' | 'driver' | 'service');
+const headed = !!process.env.HEADFUL;
+const channel = process.env.PWTEST_CHANNEL as any;
+const video = !!process.env.PWTEST_VIDEO;
 
-  async beforeAll(args: AllOptions & CommonArgs, workerInfo: folio.WorkerInfo) {
-    this._browser = await args.playwright[args.browserName].launch({
-      ...args.launchOptions,
-      _traceDir: args.traceDir,
-      channel: args.browserChannel,
-      headless: !args.headful,
-      handleSIGINT: false,
-    } as any);
-    this._browserVersion = this._browser.version();
-    this._browserMajorVersion = Number(this._browserVersion.split('.')[0]);
-    return {};
-  }
+const outputDir = path.join(__dirname, '..', '..', 'test-results');
+const testDir = path.join(__dirname, '..');
+const config: Config<CommonOptions & PlaywrightOptions> = {
+  testDir,
+  outputDir,
+  timeout: video || process.env.PWTRACE ? 60000 : 30000,
+  globalTimeout: 5400000,
+  workers: process.env.CI ? 1 : undefined,
+  forbidOnly: !!process.env.CI,
+  preserveOutput: process.env.CI ? 'failures-only' : 'always',
+  retries: process.env.CI ? 3 : 0,
+  reporter: process.env.CI ? [
+    [ 'dot' ],
+    [ 'json', { outputFile: path.join(outputDir, 'report.json') } ],
+  ] : 'line',
+  projects: [],
+};
 
-  async beforeEach(args: CommonArgs, testInfo: folio.TestInfo) {
-    testInfo.data.browserVersion = this._browserVersion;
-    this._context = await this._browser.newContext({
-      recordVideo: args.video ? { dir: testInfo.outputPath('') } : undefined,
-    });
-    const page = await this._context.newPage();
-    return {
-      context: this._context,
-      page,
-      browserVersion: this._browserVersion,
-      browserMajorVersion: this._browserMajorVersion,
-      isAndroid: false,
-      isElectron: false,
-    };
-  }
-
-  async afterEach({}) {
-    if (this._context)
-      await this._context.close();
-    this._context = undefined;
-  }
-
-  async afterAll({}, workerInfo: folio.WorkerInfo) {
-    await this._browser.close();
-  }
-}
-
-const browsers = ['chromium', 'webkit', 'firefox'] as BrowserName[];
-for (const browserName of browsers) {
+const browserNames = ['chromium', 'webkit', 'firefox'] as BrowserName[];
+for (const browserName of browserNames) {
   const executablePath = getExecutablePath(browserName);
-  if (executablePath && (process.env.FOLIO_WORKER_INDEX === undefined || process.env.FOLIO_WORKER_INDEX === ''))
+  if (executablePath && !process.env.TEST_WORKER_INDEX)
     console.error(`Using executable at ${executablePath}`);
-  const mode = (process.env.PWTEST_MODE || 'default') as ('default' | 'driver' | 'service');
-  const envConfig = {
-    options: {
+  const testIgnore: RegExp[] = browserNames.filter(b => b !== browserName).map(b => new RegExp(b));
+  testIgnore.push(/android/, /electron/, /playwright-test/);
+  config.projects.push({
+    name: browserName,
+    testDir,
+    testIgnore,
+    use: {
       mode,
       browserName,
-      headful: !!process.env.HEADFUL,
-      channel: process.env.PWTEST_CHANNEL as any,
-      video: !!process.env.PWTEST_VIDEO,
-      traceDir: process.env.PWTRACE ? path.join(config.outputDir, 'trace') : undefined,
-      launchOptions: {
-        executablePath,
-      },
+      headless: !headed,
+      channel,
+      video,
+      executablePath,
+      tracesDir: process.env.PWTRACE ? path.join(outputDir, 'trace') : undefined,
       coverageName: browserName,
     },
-    tag: browserName,
-  };
-  playwrightTest.runWith(envConfig);
-  slowPlaywrightTest.runWith({ ...envConfig, timeout: config.timeout * 3 });
-  pageTest.runWith(envConfig, new PageEnv());
-  tracingTest.runWith({ options: { ...envConfig.options, traceDir: path.join(config.outputDir, 'trace-' + process.env.FOLIO_WORKER_INDEX) }, tag: browserName });
+    define: { test: pageTest, fixtures: pageFixtures },
+    metadata: {
+      platform: process.platform,
+      docker: !!process.env.INSIDE_DOCKER,
+      headful: !!headed,
+      browserName,
+      channel,
+      mode,
+      video: !!video,
+    },
+  });
 }
+
+export default config;

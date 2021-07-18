@@ -70,7 +70,7 @@ export interface PageDelegate {
   getBoundingBox(handle: dom.ElementHandle): Promise<types.Rect | null>;
   getFrameElement(frame: frames.Frame): Promise<dom.ElementHandle>;
   scrollRectIntoViewIfNeeded(handle: dom.ElementHandle, rect?: types.Rect): Promise<'error:notvisible' | 'error:notconnected' | 'done'>;
-  setScreencastEnabled(enabled: boolean): Promise<void>;
+  setScreencastOptions(options: { width: number, height: number, quality: number } | null): Promise<void>;
 
   getAccessibilityTree(needle?: dom.ElementHandle): Promise<{tree: accessibility.AXNode, needle: accessibility.AXNode | null}>;
   pdf?: (options?: types.PDFOptions) => Promise<Buffer>;
@@ -88,6 +88,7 @@ type PageState = {
   emulatedSize: { screen: types.Size, viewport: types.Size } | null;
   mediaType: types.MediaType | null;
   colorScheme: types.ColorScheme | null;
+  reducedMotion: types.ReducedMotion | null;
   extraHTTPHeaders: types.HeadersArray | null;
 };
 
@@ -97,17 +98,12 @@ export class Page extends SdkObject {
     Crash: 'crash',
     Console: 'console',
     Dialog: 'dialog',
-    InternalDialogClosed: 'internaldialogclosed',
     Download: 'download',
     FileChooser: 'filechooser',
     DOMContentLoaded: 'domcontentloaded',
     // Can't use just 'error' due to node.js special treatment of error events.
     // @see https://nodejs.org/api/events.html#events_error_events
     PageError: 'pageerror',
-    Request: 'request',
-    Response: 'response',
-    RequestFailed: 'requestfailed',
-    RequestFinished: 'requestfinished',
     FrameAttached: 'frameattached',
     FrameDetached: 'framedetached',
     InternalFrameNavigatedToNewDocument: 'internalframenavigatedtonewdocument',
@@ -122,6 +118,7 @@ export class Page extends SdkObject {
   private _closedCallback: () => void;
   private _closedPromise: Promise<void>;
   private _disconnected = false;
+  private _initialized = false;
   private _disconnectedCallback: (e: Error) => void;
   readonly _disconnectedPromise: Promise<Error>;
   private _crashedCallback: (e: Error) => void;
@@ -163,7 +160,8 @@ export class Page extends SdkObject {
     this._state = {
       emulatedSize: browserContext._options.viewport ? { viewport: browserContext._options.viewport, screen: browserContext._options.screen || browserContext._options.viewport } : null,
       mediaType: null,
-      colorScheme: null,
+      colorScheme: browserContext._options.colorScheme !== undefined  ? browserContext._options.colorScheme : 'light',
+      reducedMotion: browserContext._options.reducedMotion !== undefined  ? browserContext._options.reducedMotion : 'no-preference',
       extraHTTPHeaders: null,
     };
     this.accessibility = new accessibility.Accessibility(delegate.getAccessibilityTree.bind(delegate));
@@ -195,12 +193,17 @@ export class Page extends SdkObject {
         return;
       this._setIsError(error);
     }
+    this._initialized = true;
     this._browserContext.emit(BrowserContext.Events.Page, this);
     // I may happen that page iniatialization finishes after Close event has already been sent,
     // in that case we fire another Close event to ensure that each reported Page will have
     // corresponding Close event after it is reported on the context.
     if (this.isClosed())
       this.emit(Page.Events.Close);
+  }
+
+  initializedOrUndefined() {
+    return this._initialized ? this : undefined;
   }
 
   async _doSlowMo() {
@@ -358,15 +361,13 @@ export class Page extends SdkObject {
     }), this._timeoutSettings.navigationTimeout(options));
   }
 
-  async emulateMedia(options: { media?: types.MediaType | null, colorScheme?: types.ColorScheme | null }) {
-    if (options.media !== undefined)
-      assert(options.media === null || types.mediaTypes.has(options.media), 'media: expected one of (screen|print|null)');
-    if (options.colorScheme !== undefined)
-      assert(options.colorScheme === null || types.colorSchemes.has(options.colorScheme), 'colorScheme: expected one of (dark|light|no-preference|null)');
+  async emulateMedia(options: { media?: types.MediaType | null, colorScheme?: types.ColorScheme | null, reducedMotion?: types.ReducedMotion | null }) {
     if (options.media !== undefined)
       this._state.mediaType = options.media;
     if (options.colorScheme !== undefined)
       this._state.colorScheme = options.colorScheme;
+    if (options.reducedMotion !== undefined)
+      this._state.reducedMotion = options.reducedMotion;
     await this._delegate.updateEmulateMedia();
     await this._doSlowMo();
   }
@@ -405,7 +406,6 @@ export class Page extends SdkObject {
   }
 
   _requestStarted(request: network.Request) {
-    this.emit(Page.Events.Request, request);
     const route = request._route();
     if (!route)
       return;
@@ -501,8 +501,12 @@ export class Page extends SdkObject {
     return this._pageBindings.get(identifier) || this._browserContext._pageBindings.get(identifier);
   }
 
-  setScreencastEnabled(enabled: boolean) {
-    this._delegate.setScreencastEnabled(enabled).catch(() => {});
+  setScreencastOptions(options: { width: number, height: number, quality: number } | null) {
+    this._delegate.setScreencastOptions(options).catch(e => debugLogger.log('error', e));
+  }
+
+  firePageError(error: Error) {
+    this.emit(Page.Events.PageError, error);
   }
 }
 
@@ -581,36 +585,36 @@ export class PageBinding {
     }
 
     function takeHandle(arg: { name: string, seq: number }) {
-      const handle = (window as any)[arg.name]['handles'].get(arg.seq);
-      (window as any)[arg.name]['handles'].delete(arg.seq);
+      const handle = (globalThis as any)[arg.name]['handles'].get(arg.seq);
+      (globalThis as any)[arg.name]['handles'].delete(arg.seq);
       return handle;
     }
 
     function deliverResult(arg: { name: string, seq: number, result: any }) {
-      (window as any)[arg.name]['callbacks'].get(arg.seq).resolve(arg.result);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).resolve(arg.result);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
 
     function deliverError(arg: { name: string, seq: number, message: string, stack: string | undefined }) {
       const error = new Error(arg.message);
       error.stack = arg.stack;
-      (window as any)[arg.name]['callbacks'].get(arg.seq).reject(error);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).reject(error);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
 
     function deliverErrorValue(arg: { name: string, seq: number, error: any }) {
-      (window as any)[arg.name]['callbacks'].get(arg.seq).reject(arg.error);
-      (window as any)[arg.name]['callbacks'].delete(arg.seq);
+      (globalThis as any)[arg.name]['callbacks'].get(arg.seq).reject(arg.error);
+      (globalThis as any)[arg.name]['callbacks'].delete(arg.seq);
     }
   }
 }
 
 function addPageBinding(bindingName: string, needsHandle: boolean) {
-  const binding = (window as any)[bindingName];
+  const binding = (globalThis as any)[bindingName];
   if (binding.__installed)
     return;
-  (window as any)[bindingName] = (...args: any[]) => {
-    const me = (window as any)[bindingName];
+  (globalThis as any)[bindingName] = (...args: any[]) => {
+    const me = (globalThis as any)[bindingName];
     if (needsHandle && args.slice(1).some(arg => arg !== undefined))
       throw new Error(`exposeBindingHandle supports a single argument, ${args.length} received`);
     let callbacks = me['callbacks'];
@@ -634,5 +638,5 @@ function addPageBinding(bindingName: string, needsHandle: boolean) {
     }
     return promise;
   };
-  (window as any)[bindingName].__installed = true;
+  (globalThis as any)[bindingName].__installed = true;
 }

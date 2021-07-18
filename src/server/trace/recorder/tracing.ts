@@ -16,23 +16,18 @@
 
 import fs from 'fs';
 import path from 'path';
-import util from 'util';
 import yazl from 'yazl';
+import { EventEmitter } from 'events';
 import { calculateSha1, createGuid, mkdirIfNeeded, monotonicTime } from '../../../utils/utils';
 import { Artifact } from '../../artifact';
 import { BrowserContext } from '../../browserContext';
-import { Dialog } from '../../dialog';
 import { ElementHandle } from '../../dom';
-import { Frame, NavigationEvent } from '../../frames';
-import { helper, RegisteredListener } from '../../helper';
+import { eventsHelper, RegisteredListener } from '../../../utils/eventsHelper';
 import { CallMetadata, InstrumentationListener, SdkObject } from '../../instrumentation';
 import { Page } from '../../page';
 import * as trace from '../common/traceEvents';
 import { TraceSnapshotter } from './traceSnapshotter';
-
-const fsAppendFileAsync = util.promisify(fs.appendFile.bind(fs));
-const fsWriteFileAsync = util.promisify(fs.writeFile.bind(fs));
-const fsMkdirAsync = util.promisify(fs.mkdir.bind(fs));
+import { commandsWithTracingSnapshots } from '../../../protocol/channels';
 
 export type TracerOptions = {
   name?: string;
@@ -40,53 +35,50 @@ export type TracerOptions = {
   screenshots?: boolean;
 };
 
+export const VERSION = 1;
+
 export class Tracing implements InstrumentationListener {
   private _appendEventChain = Promise.resolve();
   private _snapshotter: TraceSnapshotter;
   private _eventListeners: RegisteredListener[] = [];
-  private _pendingCalls = new Map<string, { sdkObject: SdkObject, metadata: CallMetadata }>();
+  private _pendingCalls = new Map<string, { sdkObject: SdkObject, metadata: CallMetadata, beforeSnapshot: Promise<void>, actionSnapshot?: Promise<void>, afterSnapshot?: Promise<void> }>();
   private _context: BrowserContext;
   private _traceFile: string | undefined;
   private _resourcesDir: string;
   private _sha1s: string[] = [];
-  private _started = false;
-  private _traceDir: string | undefined;
+  private _recordingTraceEvents = false;
+  private _tracesDir: string;
 
   constructor(context: BrowserContext) {
     this._context = context;
-    this._traceDir = context._browser.options.traceDir;
-    this._resourcesDir = path.join(this._traceDir || '', 'resources');
+    this._tracesDir = context._browser.options.tracesDir;
+    this._resourcesDir = path.join(this._tracesDir, 'resources');
     this._snapshotter = new TraceSnapshotter(this._context, this._resourcesDir, traceEvent => this._appendTraceEvent(traceEvent));
   }
 
   async start(options: TracerOptions): Promise<void> {
     // context + page must be the first events added, this method can't have awaits before them.
-    if (!this._traceDir)
-      throw new Error('Tracing directory is not specified when launching the browser');
-    if (this._started)
+    if (this._recordingTraceEvents)
       throw new Error('Tracing has already been started');
-    this._started = true;
-    this._traceFile = path.join(this._traceDir, (options.name || createGuid()) + '.trace');
+    this._recordingTraceEvents = true;
+    this._traceFile = path.join(this._tracesDir, (options.name || createGuid()) + '.trace');
 
     this._appendEventChain = mkdirIfNeeded(this._traceFile);
     const event: trace.ContextCreatedTraceEvent = {
-      timestamp: monotonicTime(),
-      type: 'context-metadata',
+      version: VERSION,
+      type: 'context-options',
       browserName: this._context._browser.options.name,
-      isMobile: !!this._context._options.isMobile,
-      deviceScaleFactor: this._context._options.deviceScaleFactor || 1,
-      viewportSize: this._context._options.viewport || undefined,
-      debugName: this._context._options._debugName,
+      options: this._context._options
     };
     this._appendTraceEvent(event);
     for (const page of this._context.pages())
       this._onPage(options.screenshots, page);
     this._eventListeners.push(
-        helper.addEventListener(this._context, BrowserContext.Events.Page, this._onPage.bind(this, options.screenshots)),
+        eventsHelper.addEventListener(this._context, BrowserContext.Events.Page, this._onPage.bind(this, options.screenshots)),
     );
 
     // context + page must be the first events added, no awaits above this line.
-    await fsMkdirAsync(this._resourcesDir, { recursive: true });
+    await fs.promises.mkdir(this._resourcesDir, { recursive: true });
 
     this._context.instrumentation.addListener(this);
     if (options.snapshots)
@@ -94,17 +86,22 @@ export class Tracing implements InstrumentationListener {
   }
 
   async stop(): Promise<void> {
-    if (!this._started)
+    if (!this._eventListeners.length)
       return;
-    this._started = false;
     this._context.instrumentation.removeListener(this);
-    helper.removeEventListeners(this._eventListeners);
-    for (const { sdkObject, metadata } of this._pendingCalls.values())
+    eventsHelper.removeEventListeners(this._eventListeners);
+    for (const { sdkObject, metadata, beforeSnapshot, actionSnapshot, afterSnapshot } of this._pendingCalls.values()) {
+      await Promise.all([beforeSnapshot, actionSnapshot, afterSnapshot]);
+      if (!afterSnapshot)
+        metadata.error = { error: { name: 'Error', message: 'Action was interrupted' } };
       await this.onAfterCall(sdkObject, metadata);
+    }
     for (const page of this._context.pages())
-      page.setScreencastEnabled(false);
+      page.setScreencastOptions(null);
+    await this._snapshotter.stop();
 
     // Ensure all writes are finished.
+    this._recordingTraceEvents = false;
     await this._appendEventChain;
   }
 
@@ -113,21 +110,25 @@ export class Tracing implements InstrumentationListener {
   }
 
   async export(): Promise<Artifact> {
-    if (!this._traceFile)
-      throw new Error('Tracing directory is not specified when launching the browser');
+    if (!this._traceFile || this._recordingTraceEvents)
+      throw new Error('Must start and stop tracing before exporting');
     const zipFile = new yazl.ZipFile();
-    zipFile.addFile(this._traceFile, 'trace.trace');
-    const zipFileName = this._traceFile + '.zip';
-    this._traceFile = undefined;
-    for (const sha1 of this._sha1s)
-      zipFile.addFile(path.join(this._resourcesDir!, sha1), path.join('resources', sha1));
-    zipFile.end();
-    await new Promise(f => {
-      zipFile.outputStream.pipe(fs.createWriteStream(zipFileName)).on('close', f);
+    const failedPromise = new Promise<Artifact>((_, reject) => (zipFile as any as EventEmitter).on('error', reject));
+
+    const succeededPromise = new Promise<Artifact>(async fulfill => {
+      zipFile.addFile(this._traceFile!, 'trace.trace');
+      const zipFileName = this._traceFile! + '.zip';
+      for (const sha1 of this._sha1s)
+        zipFile.addFile(path.join(this._resourcesDir!, sha1), path.join('resources', sha1));
+      zipFile.end();
+      await new Promise(f => {
+        zipFile.outputStream.pipe(fs.createWriteStream(zipFileName)).on('close', f);
+      });
+      const artifact = new Artifact(this._context, zipFileName);
+      artifact.reportFinished();
+      fulfill(artifact);
     });
-    const artifact = new Artifact(this._context, zipFileName);
-    artifact.reportFinished();
-    return artifact;
+    return Promise.race([failedPromise, succeededPromise]);
   }
 
   async _captureSnapshot(name: 'before' | 'after' | 'action' | 'event', sdkObject: SdkObject, metadata: CallMetadata, element?: ElementHandle) {
@@ -135,133 +136,74 @@ export class Tracing implements InstrumentationListener {
       return;
     if (!this._snapshotter.started())
       return;
+    if (!shouldCaptureSnapshot(metadata))
+      return;
     const snapshotName = `${name}@${metadata.id}`;
     metadata.snapshots.push({ title: name, snapshotName });
     await this._snapshotter!.captureSnapshot(sdkObject.attribution.page, snapshotName, element);
   }
 
   async onBeforeCall(sdkObject: SdkObject, metadata: CallMetadata) {
-    await this._captureSnapshot('before', sdkObject, metadata);
-    this._pendingCalls.set(metadata.id, { sdkObject, metadata });
+    const beforeSnapshot = this._captureSnapshot('before', sdkObject, metadata);
+    this._pendingCalls.set(metadata.id, { sdkObject, metadata, beforeSnapshot });
+    await beforeSnapshot;
   }
 
   async onBeforeInputAction(sdkObject: SdkObject, metadata: CallMetadata, element: ElementHandle) {
-    await this._captureSnapshot('action', sdkObject, metadata, element);
+    const actionSnapshot = this._captureSnapshot('action', sdkObject, metadata, element);
+    this._pendingCalls.get(metadata.id)!.actionSnapshot = actionSnapshot;
+    await actionSnapshot;
   }
 
   async onAfterCall(sdkObject: SdkObject, metadata: CallMetadata) {
-    if (!this._pendingCalls.has(metadata.id))
+    const pendingCall = this._pendingCalls.get(metadata.id);
+    if (!pendingCall || pendingCall.afterSnapshot)
       return;
-    this._pendingCalls.delete(metadata.id);
-    if (!sdkObject.attribution.page)
+    if (!sdkObject.attribution.page) {
+      this._pendingCalls.delete(metadata.id);
       return;
-    await this._captureSnapshot('after', sdkObject, metadata);
-    const event: trace.ActionTraceEvent = {
-      timestamp: metadata.startTime,
-      type: 'action',
-      metadata,
-    };
+    }
+    pendingCall.afterSnapshot = this._captureSnapshot('after', sdkObject, metadata);
+    await pendingCall.afterSnapshot;
+    const event: trace.ActionTraceEvent = { type: 'action', metadata, hasSnapshot: shouldCaptureSnapshot(metadata) };
     this._appendTraceEvent(event);
+    this._pendingCalls.delete(metadata.id);
   }
 
   onEvent(sdkObject: SdkObject, metadata: CallMetadata) {
     if (!sdkObject.attribution.page)
       return;
-    const event: trace.ActionTraceEvent = {
-      timestamp: metadata.startTime,
-      type: 'event',
-      metadata,
-    };
+    const event: trace.ActionTraceEvent = { type: 'event', metadata, hasSnapshot: false };
     this._appendTraceEvent(event);
   }
 
   private _onPage(screenshots: boolean | undefined, page: Page) {
-    const pageId = page.guid;
-
-    const event: trace.PageCreatedTraceEvent = {
-      timestamp: monotonicTime(),
-      type: 'page-created',
-      pageId,
-    };
-    this._appendTraceEvent(event);
     if (screenshots)
-      page.setScreencastEnabled(true);
+      page.setScreencastOptions({ width: 800, height: 600, quality: 90 });
 
     this._eventListeners.push(
-        helper.addEventListener(page, Page.Events.Dialog, (dialog: Dialog) => {
-          const event: trace.DialogOpenedEvent = {
-            timestamp: monotonicTime(),
-            type: 'dialog-opened',
-            pageId,
-            dialogType: dialog.type(),
-            message: dialog.message(),
-          };
-          this._appendTraceEvent(event);
-        }),
-
-        helper.addEventListener(page, Page.Events.InternalDialogClosed, (dialog: Dialog) => {
-          const event: trace.DialogClosedEvent = {
-            timestamp: monotonicTime(),
-            type: 'dialog-closed',
-            pageId,
-            dialogType: dialog.type(),
-          };
-          this._appendTraceEvent(event);
-        }),
-
-        helper.addEventListener(page.mainFrame(), Frame.Events.Navigation, (navigationEvent: NavigationEvent) => {
-          if (page.mainFrame().url() === 'about:blank')
-            return;
-          const event: trace.NavigationEvent = {
-            timestamp: monotonicTime(),
-            type: 'navigation',
-            pageId,
-            url: navigationEvent.url,
-            sameDocument: !navigationEvent.newDocument,
-          };
-          this._appendTraceEvent(event);
-        }),
-
-        helper.addEventListener(page, Page.Events.Load, () => {
-          if (page.mainFrame().url() === 'about:blank')
-            return;
-          const event: trace.LoadEvent = {
-            timestamp: monotonicTime(),
-            type: 'load',
-            pageId,
-          };
-          this._appendTraceEvent(event);
-        }),
-
-        helper.addEventListener(page, Page.Events.ScreencastFrame, params => {
+        eventsHelper.addEventListener(page, Page.Events.ScreencastFrame, params => {
           const sha1 = calculateSha1(createGuid()); // no need to compute sha1 for screenshots
           const event: trace.ScreencastFrameTraceEvent = {
             type: 'screencast-frame',
             pageId: page.guid,
             sha1,
-            pageTimestamp: params.timestamp,
             width: params.width,
             height: params.height,
             timestamp: monotonicTime()
           };
           this._appendTraceEvent(event);
           this._appendEventChain = this._appendEventChain.then(async () => {
-            await fsWriteFileAsync(path.join(this._resourcesDir!, sha1), params.buffer).catch(() => {});
+            await fs.promises.writeFile(path.join(this._resourcesDir!, sha1), params.buffer).catch(() => {});
           });
         }),
-
-        helper.addEventListener(page, Page.Events.Close, () => {
-          const event: trace.PageDestroyedTraceEvent = {
-            timestamp: monotonicTime(),
-            type: 'page-destroyed',
-            pageId,
-          };
-          this._appendTraceEvent(event);
-        })
     );
   }
 
   private _appendTraceEvent(event: any) {
+    if (!this._recordingTraceEvents)
+      return;
+
     const visit = (object: any) => {
       if (Array.isArray(object)) {
         object.forEach(visit);
@@ -283,7 +225,11 @@ export class Tracing implements InstrumentationListener {
 
     // Serialize all writes to the trace file.
     this._appendEventChain = this._appendEventChain.then(async () => {
-      await fsAppendFileAsync(this._traceFile!, JSON.stringify(event) + '\n');
+      await fs.promises.appendFile(this._traceFile!, JSON.stringify(event) + '\n');
     });
   }
+}
+
+export function shouldCaptureSnapshot(metadata: CallMetadata): boolean {
+  return commandsWithTracingSnapshots.has(metadata.type + '.' + metadata.method);
 }

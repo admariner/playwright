@@ -45,11 +45,10 @@ it('should unroute', async ({browser, server}) => {
   const page = await context.newPage();
 
   let intercepted = [];
-  const handler1 = route => {
+  await context.route('**/*', route => {
     intercepted.push(1);
     route.continue();
-  };
-  await context.route('**/empty.html', handler1);
+  });
   await context.route('**/empty.html', route => {
     intercepted.push(2);
     route.continue();
@@ -58,22 +57,23 @@ it('should unroute', async ({browser, server}) => {
     intercepted.push(3);
     route.continue();
   });
-  await context.route('**/*', route => {
+  const handler4 = route => {
     intercepted.push(4);
     route.continue();
-  });
+  };
+  await context.route('**/empty.html', handler4);
   await page.goto(server.EMPTY_PAGE);
-  expect(intercepted).toEqual([1]);
+  expect(intercepted).toEqual([4]);
 
   intercepted = [];
-  await context.unroute('**/empty.html', handler1);
+  await context.unroute('**/empty.html', handler4);
   await page.goto(server.EMPTY_PAGE);
-  expect(intercepted).toEqual([2]);
+  expect(intercepted).toEqual([3]);
 
   intercepted = [];
   await context.unroute('**/empty.html');
   await page.goto(server.EMPTY_PAGE);
-  expect(intercepted).toEqual([4]);
+  expect(intercepted).toEqual([1]);
 
   await context.close();
 });
@@ -105,5 +105,96 @@ it('should fall back to context.route', async ({browser, server}) => {
   const response = await page.goto(server.EMPTY_PAGE);
   expect(response.ok()).toBe(true);
   expect(await response.text()).toBe('context');
+  await context.close();
+});
+
+it('should support Set-Cookie header', async ({contextFactory, server, browserName}) => {
+  it.fixme(browserName === 'webkit');
+
+  const context = await contextFactory();
+  const page = await context.newPage();
+  await page.route('https://example.com/', (route, request) => {
+    route.fulfill({
+      headers: {
+        'Set-Cookie': 'name=value; domain=.example.com; Path=/'
+      },
+      contentType: 'text/html',
+      body: 'done'
+    });
+  });
+  await page.goto('https://example.com');
+  expect(await context.cookies()).toEqual([{
+    sameSite: 'None',
+    name: 'name',
+    value: 'value',
+    domain: '.example.com',
+    path: '/',
+    expires: -1,
+    httpOnly: false,
+    secure: false
+  }]);
+});
+
+it('should ignore secure Set-Cookie header for insecure requests', async ({contextFactory, server, browserName}) => {
+  it.fixme(browserName === 'webkit');
+
+  const context = await contextFactory();
+  const page = await context.newPage();
+  await page.route('http://example.com/', (route, request) => {
+    route.fulfill({
+      headers: {
+        'Set-Cookie': 'name=value; domain=.example.com; Path=/; Secure'
+      },
+      contentType: 'text/html',
+      body: 'done'
+    });
+  });
+  await page.goto('http://example.com');
+  expect(await context.cookies()).toEqual([]);
+});
+
+it('should use Set-Cookie header in future requests', async ({contextFactory, server, browserName}) => {
+  it.fixme(browserName === 'webkit');
+
+  const context = await contextFactory();
+  const page = await context.newPage();
+
+  await page.route(server.EMPTY_PAGE, (route, request) => {
+    route.fulfill({
+      headers: {
+        'Set-Cookie': 'name=value'
+      },
+      contentType: 'text/html',
+      body: 'done'
+    });
+  });
+  await page.goto(server.EMPTY_PAGE);
+  expect(await context.cookies()).toEqual([{
+    sameSite: 'None',
+    name: 'name',
+    value: 'value',
+    domain: 'localhost',
+    path: '/',
+    expires: -1,
+    httpOnly: false,
+    secure: false
+  }]);
+
+  let cookie = '';
+  server.setRoute('/foo.html', (req, res) => {
+    cookie = req.headers.cookie;
+    res.end();
+  });
+  await page.goto(server.PREFIX + '/foo.html');
+  expect(cookie).toBe('name=value');
+});
+
+it('should work with ignoreHTTPSErrors', async ({browser, httpsServer}) => {
+  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+
+  await page.route('**/*', route => route.continue());
+  const response = await page.goto(httpsServer.EMPTY_PAGE);
+  expect(response.status()).toBe(200);
   await context.close();
 });
